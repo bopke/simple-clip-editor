@@ -45,9 +45,6 @@ impl Handle {
     fn moves_bottom(self) -> bool {
         matches!(self, Handle::S | Handle::SE | Handle::SW)
     }
-    fn is_corner(self) -> bool {
-        matches!(self, Handle::NE | Handle::NW | Handle::SE | Handle::SW)
-    }
 }
 
 /// Minimum crop size in source pixels. Small enough not to get in the way,
@@ -192,7 +189,6 @@ pub fn drag_handle(
             t = (cy - h / 2.0).clamp(0.0, bh - h);
             b = t + h;
         }
-        let _ = handle.is_corner();
     }
 
     finalise(l, t, r, b, bounds)

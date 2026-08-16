@@ -19,7 +19,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 use crate::ffmpeg::{tools_in_dir, Origin, Tools};
@@ -263,31 +263,25 @@ fn wanted(name: &str) -> bool {
 }
 
 /// Pull just the binaries out, wherever the archive happens to put them —
-/// osxexperts zips them at the root, BtbN nests them under `<name>/bin/`.
+/// martin-riedl zips them at the root, BtbN nests them under `<name>/bin/`.
 fn extract(archive: &Path, dest: &Path) -> Result<()> {
-    let name = archive.to_string_lossy().to_string();
-    let _ = name;
-    let mut file = File::open(archive)?;
+    let mut file = File::open(archive).with_context(|| format!("opening {}", archive.display()))?;
     let mut magic = [0u8; 6];
-    file.read_exact(&mut magic).context("empty archive")?;
-    file.rewind_start()?;
+    // Naming the file matters here: the caller's context says which *URL* was
+    // being extracted, which is not the same as which file on disk is short.
+    file.read_exact(&mut magic)
+        .with_context(|| format!("{} is empty or truncated", archive.display()))?;
+    file.rewind()?;
 
     if &magic[..2] == b"PK" {
         extract_zip(file, dest)
     } else if magic == [0xfd, b'7', b'z', b'X', b'Z', 0x00] {
         extract_tar_xz(file, dest, archive)
     } else {
-        bail!("unrecognised archive format")
-    }
-}
-
-trait Rewind {
-    fn rewind_start(&mut self) -> io::Result<()>;
-}
-impl Rewind for File {
-    fn rewind_start(&mut self) -> io::Result<()> {
-        use std::io::Seek;
-        self.seek(io::SeekFrom::Start(0)).map(|_| ())
+        bail!(
+            "unrecognised archive format in {} (magic {magic:02x?})",
+            archive.display()
+        )
     }
 }
 
@@ -443,5 +437,29 @@ mod tests {
         assert!(wanted("ffprobe.exe"));
         assert!(!wanted("ffplay"));
         assert!(!wanted("README.txt"));
+    }
+
+    /// A failed extraction has to say *which file*: the caller only knows the
+    /// URL it was fetching, and on macOS two archives land on the same
+    /// `download.tmp`, so "unrecognised archive format" alone identifies
+    /// nothing.
+    #[test]
+    fn extraction_errors_name_the_archive() {
+        let dir = std::env::temp_dir().join("clip-editor-extract-test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let junk = dir.join("junk.bin");
+        fs::write(&junk, b"not an archive").unwrap();
+        let err = extract(&junk, &dir).unwrap_err().to_string();
+        assert!(err.contains("unrecognised archive format"), "{err}");
+        assert!(err.contains("junk.bin"), "{err}");
+
+        let empty = dir.join("empty.bin");
+        fs::write(&empty, b"").unwrap();
+        let err = extract(&empty, &dir).unwrap_err().to_string();
+        assert!(err.contains("empty.bin"), "{err}");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
