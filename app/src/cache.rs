@@ -21,10 +21,6 @@ pub fn cache_root() -> Result<PathBuf> {
     Ok(dirs.cache_dir().to_path_buf())
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 /// Identity of a source file for caching purposes.
 pub fn source_key(path: &Path, fps: Rational) -> Result<String> {
     let meta = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
@@ -39,7 +35,7 @@ pub fn source_key(path: &Path, fps: Rational) -> Result<String> {
     h.update(mtime.to_le_bytes());
     h.update(meta.len().to_le_bytes());
     h.update(format!("fps={}/{}", fps.num, fps.den).as_bytes());
-    Ok(hex(&h.finalize())[..16].to_string())
+    Ok(crate::hex::encode(&h.finalize())[..16].to_string())
 }
 
 /// Per-source cache directory: proxy, PCM, waveform peaks, thumbnail strip.

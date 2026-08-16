@@ -8,6 +8,7 @@ pub mod cache;
 pub mod export;
 pub mod ffmpeg;
 pub mod glyphs;
+pub mod hex;
 pub mod import;
 pub mod jobs;
 pub mod keys;

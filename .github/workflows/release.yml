@@ -185,8 +185,16 @@ jobs:
 
           ## Licence
 
-          GPL-3.0-or-later. The app runs a GPL ffmpeg build; its source is at
-          <https://github.com/FFmpeg/FFmpeg/tree/release/8.1>.
+          GPL-3.0-or-later. The app runs a GPL ffmpeg build that it downloads on
+          first run. The two vendors are not on the same major version, so the
+          source depends on which build you received — these mirror the
+          per-platform \`SOURCE_URL\` in \`app/src/bootstrap.rs\`, and the app
+          shows the same link on its first-run screen.
+
+          | Platform | Pinned ffmpeg | Source |
+          |---|---|---|
+          | macOS (Apple Silicon) | 9.0 (martin-riedl) | <https://github.com/FFmpeg/FFmpeg/tree/release/9.0> |
+          | Windows / Linux | n8.1.2 (BtbN) | <https://github.com/FFmpeg/FFmpeg/tree/release/8.1> |
           EOF
 
           gh release create "$TAG" \

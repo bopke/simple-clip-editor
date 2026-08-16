@@ -3,6 +3,18 @@
 //! The download is pinned to a specific build. A silent ffmpeg upgrade
 //! changing filter or CLI behaviour underneath the app is a genuinely
 //! unpleasant bug class, so updating these constants is a deliberate change.
+//!
+//! A pin is only worth as much as the URL under it, so every URL here must be
+//! **immutable** — a vendor that overwrites a file in place turns the checksum
+//! from a guarantee into a scheduled outage, since the day they publish an
+//! update is the day first-run stops working for everyone. That rules out
+//! unversioned filenames however reputable the publisher: BtbN's dated
+//! autobuild tags qualify, martin-riedl's timestamped release directories
+//! qualify, `ffmpeg9arm.zip` does not.
+//!
+//! Each vendor also publishes its own SHA-256 next to the artifact, so the
+//! constants below were cross-checked against the publisher's value rather
+//! than merely recording whatever bytes happened to arrive here.
 
 use anyhow::{anyhow, bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -16,14 +28,23 @@ use crate::ffmpeg::{tools_in_dir, Origin, Tools};
 /// and stored next to the binaries so a changed pin triggers a re-download.
 pub const PINNED_VERSION: &str = match () {
     #[cfg(target_os = "macos")]
-    () => "ffmpeg 9.x (osxexperts, arm64)",
+    () => "ffmpeg 9.0 (martin-riedl, arm64)",
     #[cfg(not(target_os = "macos"))]
     () => "ffmpeg n8.1.2 (BtbN autobuild-2026-08-12-13-15)",
 };
 
 /// Where the ffmpeg source for the shipped build lives — the GPL obligation is
-/// to link to the exact tarball in the release notes, and this is that link.
-pub const SOURCE_URL: &str = "https://github.com/FFmpeg/FFmpeg/tree/release/8.1";
+/// to link to the exact source in the release notes, and this is that link.
+///
+/// One constant per platform because the vendors are not on the same major:
+/// the macOS build is 9.0 and BtbN publishes no 9.x at all, so a single URL
+/// cannot describe both without lying to one of them.
+pub const SOURCE_URL: &str = match () {
+    #[cfg(target_os = "macos")]
+    () => "https://github.com/FFmpeg/FFmpeg/tree/release/9.0",
+    #[cfg(not(target_os = "macos"))]
+    () => "https://github.com/FFmpeg/FFmpeg/tree/release/8.1",
+};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Download {
@@ -37,23 +58,32 @@ pub struct Download {
 ///
 /// Empty means there is no pinned build for this platform — the first-run
 /// screen then offers only the "use your own ffmpeg" paths. That is the case
-/// on Intel macOS: the only static builds available there are a different
-/// ffmpeg major from the Apple Silicon ones, and shipping two different
-/// ffmpeg versions to one platform is the silent-behaviour-difference problem
-/// this pinning exists to avoid.
+/// on Intel macOS, because the release itself is Apple Silicon only (see
+/// `scripts/bundle-macos.sh`), so nobody running a released build can reach
+/// this arm. Note that the availability argument that used to be here no
+/// longer applies: the macOS vendor below publishes a matching 9.0 amd64
+/// build at `/download/macos/amd64/`, so if Intel ever becomes a release
+/// target, pinning it is a two-line change and does not reintroduce a
+/// split-major.
 pub fn downloads() -> &'static [Download] {
+    // martin-riedl rather than osxexperts: the path is timestamped and
+    // therefore immutable, the vendor publishes a `.sha256` beside each
+    // archive, and the build is a tagged 9.0 release rather than a git
+    // snapshot — so [`SOURCE_URL`] can name an exact release branch.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         &[
             Download {
-                url: "https://www.osxexperts.net/ffmpeg9arm.zip",
-                sha256: "d0c06c5c68ce48af3143b262f7a9118a7c9f67de1e237fcc24ffb14df9c67af9",
-                size: 22_608_364,
+                url:
+                    "https://ffmpeg.martin-riedl.de/download/macos/arm64/1785863997_9.0/ffmpeg.zip",
+                sha256: "5267ef149ee0d208057a1b316aac079b661b0476574dee5da7d225769773c603",
+                size: 28_440_078,
             },
             Download {
-                url: "https://www.osxexperts.net/ffprobe9arm.zip",
-                sha256: "0c94fbdd8917022f28115eca512196cf4648732bc9e5db9ec8896c7e519d02aa",
-                size: 22_530_006,
+                url:
+                    "https://ffmpeg.martin-riedl.de/download/macos/arm64/1785863997_9.0/ffprobe.zip",
+                sha256: "7778fbb533fb60d3336cbd9a9e51eced71658f020b570c7203590c1c41d42f50",
+                size: 28_364_088,
             },
         ]
     }
@@ -110,6 +140,10 @@ fn stamp_path(dir: &Path) -> PathBuf {
 }
 
 /// Tools already installed and matching the pinned version.
+///
+/// The stamp is written last and only after the binary has proved it runs, so
+/// a matching stamp means a complete install of the build we currently pin.
+/// Changing [`PINNED_VERSION`] is therefore what triggers a re-download.
 pub fn installed() -> Option<Tools> {
     let dir = install_dir().ok()?;
     let stamp = fs::read_to_string(stamp_path(&dir)).ok()?;
@@ -181,13 +215,15 @@ pub fn install(
     }
 
     make_executable(&dir)?;
-    fs::write(stamp_path(&dir), PINNED_VERSION)?;
 
     let tools = tools_in_dir(&dir, Origin::Managed)
         .ok_or_else(|| anyhow!("archive did not contain ffmpeg and ffprobe"))?;
     tools
         .verify()
         .context("the downloaded ffmpeg would not run")?;
+    // Written last, and only once the binary has proved it runs, so a stamp
+    // never advertises a half-finished install.
+    fs::write(stamp_path(&dir), PINNED_VERSION)?;
     Ok(tools)
 }
 
@@ -219,15 +255,7 @@ fn fetch(
         on_chunk(n as u64);
     }
     file.flush()?;
-    Ok(hex(&hasher.finalize()))
-}
-
-fn hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
+    Ok(crate::hex::encode(&hasher.finalize()))
 }
 
 fn wanted(name: &str) -> bool {
@@ -349,6 +377,7 @@ mod tests {
         for d in downloads() {
             assert!(d.url.starts_with("https://"), "{}", d.url);
             assert_eq!(d.sha256.len(), 64, "{}", d.url);
+            assert!(d.sha256.chars().all(|c| c.is_ascii_hexdigit()), "{}", d.url);
             assert!(d.size > 1_000_000);
         }
         // Every platform we ship a build for has a pinned ffmpeg; Intel macOS
@@ -356,6 +385,47 @@ mod tests {
         if cfg!(not(all(target_os = "macos", not(target_arch = "aarch64")))) {
             assert!(has_pinned_build());
             assert!(total_download_bytes() > 0);
+        }
+    }
+
+    /// A checksum pin is only as good as the URL beneath it: if the vendor can
+    /// overwrite that path, the pin stops being a guarantee and becomes a
+    /// scheduled outage on the day they publish an update. Every URL must
+    /// therefore carry something that makes it immutable — a dated tag, a
+    /// timestamped directory, a version in the filename.
+    #[test]
+    fn pinned_urls_are_immutable() {
+        for d in downloads() {
+            let immutable = d.url.contains("autobuild-") || d.url.contains("_9.0/");
+            assert!(
+                immutable,
+                "{} has no version or timestamp in its path, so the vendor can \
+                 replace it and break every first run",
+                d.url
+            );
+        }
+    }
+
+    /// The source link is a licence obligation, so it has to name the release
+    /// the pinned build was actually cut from. The vendors are on different
+    /// majors; this is what stops the two drifting apart again.
+    #[test]
+    fn the_source_url_matches_the_pinned_build() {
+        let (branch, marker) = if cfg!(target_os = "macos") {
+            ("release/9.0", "_9.0/")
+        } else {
+            ("release/8.1", "n8.1.2")
+        };
+        assert!(
+            SOURCE_URL.ends_with(branch),
+            "{SOURCE_URL} does not point at {branch}"
+        );
+        for d in downloads() {
+            assert!(
+                d.url.contains(marker),
+                "{} is not the {branch} build that SOURCE_URL advertises",
+                d.url
+            );
         }
     }
 
@@ -373,10 +443,5 @@ mod tests {
         assert!(wanted("ffprobe.exe"));
         assert!(!wanted("ffplay"));
         assert!(!wanted("README.txt"));
-    }
-
-    #[test]
-    fn hex_is_lowercase_and_padded() {
-        assert_eq!(hex(&[0x0f, 0xa0, 0x00]), "0fa000");
     }
 }
