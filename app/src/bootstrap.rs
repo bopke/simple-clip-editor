@@ -57,14 +57,11 @@ pub struct Download {
 /// separate archives; BtbN ships both in one.
 ///
 /// Empty means there is no pinned build for this platform — the first-run
-/// screen then offers only the "use your own ffmpeg" paths. That is the case
-/// on Intel macOS, because the release itself is Apple Silicon only (see
-/// `scripts/bundle-macos.sh`), so nobody running a released build can reach
-/// this arm. Note that the availability argument that used to be here no
-/// longer applies: the macOS vendor below publishes a matching 9.0 amd64
-/// build at `/download/macos/amd64/`, so if Intel ever becomes a release
-/// target, pinning it is a two-line change and does not reintroduce a
-/// split-major.
+/// screen then offers only the "use your own ffmpeg" paths. Intel macOS is
+/// empty because the release is Apple Silicon only (see
+/// `scripts/bundle-macos.sh`); the vendor below does publish a matching 9.0
+/// amd64 build at `/download/macos/amd64/`, so pinning it is a two-line change
+/// if that ever changes.
 pub fn downloads() -> &'static [Download] {
     // martin-riedl rather than osxexperts: the path is timestamped and
     // therefore immutable, the vendor publishes a `.sha256` beside each

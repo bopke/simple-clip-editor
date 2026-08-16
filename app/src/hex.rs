@@ -1,11 +1,7 @@
 //! Lowercase hex encoding for digests.
 //!
-//! Its own module rather than a helper on either caller: `bootstrap` hashes
-//! downloads and `cache` hashes source identity, and neither has any business
-//! reaching into the other. It stays in `app` rather than moving to `core`,
-//! whose stated remit is the editing model — a hex encoder is not part of that
-//! vocabulary, and deduplicating into the wrong crate is worse than leaving a
-//! copy behind.
+//! Shared by `bootstrap` (download checksums) and `cache` (source identity),
+//! so it belongs to neither.
 
 /// Lowercase, zero-padded, two characters per byte.
 pub fn encode(bytes: &[u8]) -> String {

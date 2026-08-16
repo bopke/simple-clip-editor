@@ -175,7 +175,10 @@ fn a_missing_source_is_reported_but_the_edit_still_opens() {
 
     assert!(reopened.project.is_some(), "the edit is still worth having");
     assert!(
-        reopened.errors.iter().any(|e| e.contains("missing")),
+        reopened
+            .errors
+            .iter()
+            .any(|e| e.message.contains("missing")),
         "{:?}",
         reopened.errors
     );
@@ -198,7 +201,10 @@ fn a_project_written_by_a_newer_build_is_refused() {
     other.open_project_path(path);
     assert!(other.project.is_none(), "nothing half-loaded");
     assert!(
-        other.errors.iter().any(|e| e.contains("newer version")),
+        other
+            .errors
+            .iter()
+            .any(|e| e.message.contains("newer version")),
         "{:?}",
         other.errors
     );
@@ -363,4 +369,39 @@ fn restoring_recovered_work_opens_it_as_unsaved() {
     assert!(fresh.unsaved);
     assert!(fresh.save_path.is_none());
     assert!(fresh.pending_recovery.is_none());
+}
+
+// -- #6: the error list is bounded -----------------------------------------
+
+/// A failing proxy produces one `FrameFailed` per requested frame, which is
+/// one per scrub tick. The list the user sees has to survive that.
+#[test]
+fn a_flood_of_frame_failures_stays_bounded() {
+    let ctx = egui::Context::default();
+    let dir = workdir("error-flood");
+    let mut app = app_with_project(&ctx, &dir);
+
+    for frame in 0..500u64 {
+        app.tx
+            .send(clip_editor::jobs::Msg::FrameFailed(format!(
+                "frame {frame} could not be decoded"
+            )))
+            .unwrap();
+    }
+    // The same failure repeating, which is the commoner shape.
+    for _ in 0..500 {
+        app.tx
+            .send(clip_editor::jobs::Msg::Error("proxy is unreadable".into()))
+            .unwrap();
+    }
+    app.drain_messages(&ctx);
+
+    assert!(app.errors.len() <= 16, "{} entries", app.errors.len());
+    let repeated = app
+        .errors
+        .iter()
+        .find(|e| e.message == "proxy is unreadable")
+        .expect("a repeated message is kept, once");
+    assert_eq!(repeated.count, 500);
+    assert_eq!(repeated.label(), "proxy is unreadable (×500)");
 }

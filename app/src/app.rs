@@ -4,6 +4,7 @@
 
 use crate::audio::{Pcm, Waveform};
 use crate::cache::SourceCache;
+use crate::errors::ErrorLog;
 use crate::export;
 use crate::ffmpeg::{Cancel, Tools};
 use crate::import::{self, FrameRequest, FrameServer};
@@ -59,13 +60,9 @@ pub struct App {
 
     pub waveform: Option<Arc<Waveform>>,
     pub pcm: Option<Arc<Pcm>>,
-    /// Decoded audio for added tracks, keyed by identity rather than position.
-    ///
-    /// This was a `Vec` index-aligned with `project.added_tracks`, which is the
-    /// condition that made a removal misroute an in-flight decode: two
-    /// sequences that must be kept in step, one of them mutated from the UI and
-    /// the other from a worker. A map has no positions to keep in step, and an
-    /// entry with no matching track is inert rather than wrong.
+    /// Decoded audio for added tracks, keyed by identity so a removal cannot
+    /// misroute an in-flight decode. An entry with no matching track is inert
+    /// rather than wrong.
     pub track_pcm: HashMap<TrackId, Arc<Pcm>>,
     /// Tracks with a decode in flight. A track with no PCM is not necessarily
     /// one that needs loading — it may be one that is loading right now, and
@@ -100,7 +97,7 @@ pub struct App {
 
     pub undo: UndoStack,
     pub status: String,
-    pub errors: Vec<String>,
+    pub errors: ErrorLog,
     pub hdr_warning: bool,
 
     /// Where `Ctrl+S` writes without asking. `None` until the edit has been
@@ -109,8 +106,8 @@ pub struct App {
     /// Edits since the last save. Drives the title bar and, with it, whether
     /// there is anything worth recovering after a crash.
     pub unsaved: bool,
-    /// An autosave from a previous run that ended without a clean exit,
-    /// waiting for the user to take it or leave it.
+    /// Unsaved work from the previous run — closed without saving, or not
+    /// closed at all — waiting for the user to take it or leave it.
     pub pending_recovery: Option<recovery::Pending>,
     /// When the recovery snapshot was last written.
     last_autosave: Instant,
@@ -189,7 +186,7 @@ impl App {
             output_path: None,
             undo: UndoStack::default(),
             status: String::new(),
-            errors: Vec::new(),
+            errors: ErrorLog::default(),
             hdr_warning: false,
             save_path: None,
             unsaved: false,
@@ -264,7 +261,7 @@ impl App {
     /// Open a video: a brand new edit over it.
     fn import_source(&mut self, path: PathBuf) {
         let Some(tools) = self.tools.clone() else {
-            self.errors.push("ffmpeg is not set up yet".into());
+            self.errors.push("ffmpeg is not set up yet");
             return;
         };
         match import::probe_source(&tools, &path) {
@@ -759,7 +756,7 @@ impl App {
         };
         if project.normalised_segments().is_empty() {
             self.errors
-                .push("nothing to export — the timeline is empty".into());
+                .push("nothing to export — the timeline is empty");
             return;
         }
         let Some(out) = self.output_path.clone() else {
@@ -807,10 +804,9 @@ impl App {
     /// The half of `add_audio_track` that does not need a file dialog, so the
     /// add/remove/decode interleaving can be driven in a test.
     pub fn add_audio_track_from_path(&mut self, path: PathBuf) {
-        if self.tools.is_none() || self.cache.is_none() {
-            return;
-        }
-        if self.project.is_none() {
+        // Everything the load needs, checked before the snapshot so a call
+        // that cannot do anything does not consume an undo step.
+        if self.tools.is_none() || self.cache.is_none() || self.project.is_none() {
             return;
         }
         self.snapshot();
@@ -946,9 +942,7 @@ impl App {
                 }
                 Msg::FrameFailed(e) => {
                     self.pending_frame = None;
-                    if self.errors.len() < 8 {
-                        self.errors.push(e);
-                    }
+                    self.errors.push(e);
                 }
                 Msg::ExportProgress { fraction, label } => {
                     self.export_progress = fraction;
@@ -1066,8 +1060,8 @@ fn regrid(f: FrameIdx, from: Rational, to: Rational) -> FrameIdx {
 /// Where a track's decoded PCM is written. Named by id so the same name is
 /// never handed out to two different tracks — see [`TrackId`].
 ///
-/// Public because the file outliving a removal is now load-bearing: undo reads
-/// it back, and a test has to be able to look at it.
+/// Public so a test can look at it: the file outlives the track's removal,
+/// because undo reads it back.
 pub fn scratch_path(cache: &SourceCache, id: TrackId) -> PathBuf {
     cache.dir.join(format!("track_{}.f32", id.0))
 }

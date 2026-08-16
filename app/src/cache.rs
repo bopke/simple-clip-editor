@@ -89,12 +89,11 @@ impl SourceCache {
 
     /// Record that this source was opened, so [`cleanup`] keeps it.
     ///
-    /// The timestamp is the marker's *contents*, not any filesystem timestamp.
-    /// The directory's mtime does not move when a file inside it is rewritten
-    /// (only when an entry is added or removed), which is what made the
-    /// previous version of this effective exactly once — on first import — and
-    /// never again. Writing seconds into the file keeps the writer and
-    /// [`last_used`] talking about the same thing, on every filesystem.
+    /// The timestamp is the marker's *contents*, not any filesystem timestamp:
+    /// a directory's mtime only moves when an entry is added or removed, not
+    /// when a file inside it is rewritten, so it cannot record a re-open.
+    /// Writing seconds into the file keeps this and [`last_used`] talking
+    /// about the same thing, on every filesystem.
     pub fn touch(&self) {
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)

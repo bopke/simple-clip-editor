@@ -186,9 +186,9 @@ fn errors(app: &mut App, ctx: &egui::Context) {
         .anchor(egui::Align2::CENTER_BOTTOM, egui::Vec2::new(0.0, -24.0))
         .show(ctx, |ui| {
             ui.set_max_width(520.0);
-            for e in app.errors.iter().rev().take(4) {
+            for e in app.errors.recent(4) {
                 ui.label(
-                    RichText::new(e)
+                    RichText::new(e.label())
                         .size(11.0)
                         .color(Color32::from_rgb(240, 160, 160)),
                 );

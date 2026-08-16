@@ -5,6 +5,7 @@ pub mod app;
 pub mod audio;
 pub mod bootstrap;
 pub mod cache;
+pub mod errors;
 pub mod export;
 pub mod ffmpeg;
 pub mod glyphs;
