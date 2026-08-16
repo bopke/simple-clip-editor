@@ -3,20 +3,23 @@
 //! simpler than diffing and impossible to get subtly wrong.
 
 use clip_core::Project;
+use std::collections::VecDeque;
 
 const MAX_DEPTH: usize = 100;
 
+/// Both stacks push and pop at the back; `past` also drops from the front once
+/// it is full, which is the only reason this is a deque rather than a `Vec`.
 #[derive(Default)]
 pub struct UndoStack {
-    past: Vec<Project>,
-    future: Vec<Project>,
+    past: VecDeque<Project>,
+    future: VecDeque<Project>,
 }
 
 impl UndoStack {
     pub fn push(&mut self, before: Project) {
-        self.past.push(before);
+        self.past.push_back(before);
         if self.past.len() > MAX_DEPTH {
-            self.past.remove(0);
+            self.past.pop_front();
         }
         self.future.clear();
     }
@@ -29,15 +32,21 @@ impl UndoStack {
         !self.future.is_empty()
     }
 
+    /// Number of undo steps available. Exposed so tests can assert that an
+    /// edit produced exactly one entry.
+    pub fn depth(&self) -> usize {
+        self.past.len()
+    }
+
     pub fn undo(&mut self, current: Project) -> Option<Project> {
-        let prev = self.past.pop()?;
-        self.future.push(current);
+        let prev = self.past.pop_back()?;
+        self.future.push_back(current);
         Some(prev)
     }
 
     pub fn redo(&mut self, current: Project) -> Option<Project> {
-        let next = self.future.pop()?;
-        self.past.push(current);
+        let next = self.future.pop_back()?;
+        self.past.push_back(current);
         Some(next)
     }
 }
@@ -86,6 +95,13 @@ mod tests {
         for i in 0..(MAX_DEPTH + 20) {
             stack.push(project(i as u64));
         }
-        assert_eq!(stack.past.len(), MAX_DEPTH);
+        assert_eq!(stack.depth(), MAX_DEPTH);
+        // The *oldest* entries are the ones dropped, so the 20 overflowing
+        // pushes cost states 0..20 and the newest is still on top.
+        assert_eq!(stack.past.front().unwrap().segments[0].end, FrameIdx(20));
+        assert_eq!(
+            stack.past.back().unwrap().segments[0].end,
+            FrameIdx((MAX_DEPTH + 19) as u64)
+        );
     }
 }

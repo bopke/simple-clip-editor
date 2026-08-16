@@ -274,6 +274,8 @@ impl App {
         if project.project_fps == fps {
             return;
         }
+        self.snapshot();
+        let project = self.project.as_mut().expect("checked just above");
         let old = project.project_fps;
         // Edit points are frame indices, so they have to be rescaled.
         let scale = fps.as_f64() / old.as_f64();
@@ -523,14 +525,16 @@ impl App {
     /// The half of `add_audio_track` that does not need a file dialog, so the
     /// add/remove/decode interleaving can be driven in a test.
     pub fn add_audio_track_from_path(&mut self, path: PathBuf) {
-        let (Some(tools), Some(project), Some(cache)) = (
-            self.tools.clone(),
-            self.project.as_mut(),
-            self.cache.clone(),
-        ) else {
+        let (Some(tools), Some(cache)) = (self.tools.clone(), self.cache.clone()) else {
             return;
         };
-        self.undo.push(project.clone());
+        if self.project.is_none() {
+            return;
+        }
+        self.snapshot();
+        let Some(project) = self.project.as_mut() else {
+            return;
+        };
         let track = clip_core::AudioTrack::new(path.clone());
         let id = track.id;
         project.added_tracks.push(track);
@@ -548,13 +552,19 @@ impl App {
     /// Remove by position — the UI acts on the list it is drawing, and that is
     /// a legitimate use of an index because it is resolved immediately.
     pub fn remove_audio_track(&mut self, index: usize) {
+        // Validate before snapshotting: a removal the UI cannot satisfy must
+        // not leave an undo entry that undoes nothing.
+        if !self
+            .project
+            .as_ref()
+            .is_some_and(|p| index < p.added_tracks.len())
+        {
+            return;
+        }
         self.snapshot();
         let Some(p) = self.project.as_mut() else {
             return;
         };
-        if index >= p.added_tracks.len() {
-            return;
-        }
         let removed = p.added_tracks.remove(index);
         // Dropping the decoded audio here means an undo restores the track
         // without its samples, which is what the old code did too. Keeping it
