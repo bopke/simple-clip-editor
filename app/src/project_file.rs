@@ -12,6 +12,7 @@
 use anyhow::{bail, Context, Result};
 use clip_core::{FrameIdx, Project};
 use serde::{Deserialize, Serialize};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub const EXTENSION: &str = "clip";
@@ -87,27 +88,64 @@ pub fn save(path: &Path, project: &Project, view: &ViewState) -> Result<()> {
     write_atomically(path, &bytes).with_context(|| format!("saving {}", path.display()))
 }
 
-/// Write via a temporary file in the same directory, then rename.
+/// Write via a temporary file in the same directory, flush it, then rename.
 ///
 /// A crash — or a full disk — partway through writing must not leave a
 /// truncated project where a good one used to be. Rename within a directory is
 /// atomic on every platform this runs on.
+///
+/// Atomic is not the same as durable, and the recovery snapshot needs both. The
+/// rename orders the *entry*, not the bytes: without `sync_all` on the tmp
+/// file, a power loss just after the rename can leave the name pointing at
+/// blocks that were never written, on ext4 and friends. Syncing the directory
+/// afterwards is what makes the rename itself survive the same event. Both
+/// together cost one fsync pair every 15 seconds while an edit is unsaved,
+/// which is the trade a file whose entire job is surviving a hard stop should
+/// be making.
 pub fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension(format!("{EXTENSION}.tmp"));
-    std::fs::write(&tmp, bytes)?;
+    let write = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    })();
+    if let Err(e) = write {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
     // Windows will not rename onto an existing file.
     #[cfg(windows)]
     let _ = std::fs::remove_file(path);
     match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            sync_dir(path.parent());
+            Ok(())
+        }
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
             Err(e.into())
         }
     }
+}
+
+/// Flush the directory entry the rename just created.
+///
+/// Unix only, and best-effort: Windows has no directory handle to sync and
+/// some filesystems refuse the open outright. A failure here means the write is
+/// merely atomic rather than durable, which is where it was before — not a
+/// reason to fail a save that has already landed.
+fn sync_dir(dir: Option<&Path>) {
+    #[cfg(unix)]
+    if let Some(dir) = dir {
+        if let Ok(handle) = std::fs::File::open(dir) {
+            let _ = handle.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
 }
 
 pub fn load(path: &Path) -> Result<ClipFile> {
@@ -117,7 +155,11 @@ pub fn load(path: &Path) -> Result<ClipFile> {
 }
 
 pub fn from_str(text: &str) -> Result<ClipFile> {
-    let mut file: ClipFile = serde_json::from_str(text).context("not a Clip project file")?;
+    // The serde message is part of the error rather than a hidden cause: it
+    // names the field and the line, and "not a Clip project file" on its own
+    // tells the user nothing they can act on.
+    let mut file: ClipFile =
+        serde_json::from_str(text).map_err(|e| anyhow::anyhow!("not a Clip project file: {e}"))?;
     if file.version > FORMAT_VERSION {
         bail!(
             "this project was written by a newer version of Clip \
@@ -125,6 +167,14 @@ pub fn from_str(text: &str) -> Result<ClipFile> {
             file.version
         );
     }
+    // Serde proved the shape; these prove the invariants. A file that passes
+    // serde and fails the model is the dangerous case — it loads, and then
+    // panics somewhere far away from here. What can be nudged back into range
+    // is; what cannot is refused, because the alternative is a panic later.
+    file.project.repair();
+    file.project
+        .validate()
+        .map_err(|e| anyhow::anyhow!("this project file is not usable: {e}"))?;
     // Ids in the file were minted by whichever process wrote it, and this one
     // has its own counter and its own scratch files named from it.
     file.project.reassign_track_ids();
@@ -284,6 +334,68 @@ mod tests {
         assert!(from_str("{}").is_err());
     }
 
+    /// The dangerous input is not the one serde rejects — it is the one serde
+    /// *accepts* and the model cannot use. Each of these used to load happily
+    /// and panic later, somewhere with no idea a file was involved.
+    #[test]
+    fn a_file_that_parses_but_breaks_the_model_is_refused() {
+        let text = String::from_utf8(to_bytes(&nontrivial(), &view()).unwrap()).unwrap();
+        let mutated = |f: &dyn Fn(&mut serde_json::Value)| {
+            let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            f(&mut v);
+            from_str(&v.to_string())
+        };
+
+        // `0/0` divides by zero in FrameIdx::from_time_round.
+        let err = mutated(&|v| v["project"]["project_fps"] = serde_json::json!({"num":0,"den":0}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("zero denominator"), "{err}");
+
+        // A rate that is a well-formed rational but still not a rate.
+        let err = mutated(&|v| v["project"]["project_fps"] = serde_json::json!({"num":0,"den":1}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a rate"), "{err}");
+
+        // A negative duration makes every frame count negative.
+        let err = mutated(&|v| {
+            v["project"]["source"]["duration"] = serde_json::json!({"num":-5,"den":1})
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("duration"), "{err}");
+
+        // Unchanged, the same file still loads — the check is not just "no".
+        assert!(mutated(&|_| {}).is_ok());
+    }
+
+    /// A crop over the edge of the picture is a bad `crop` filter argument, not
+    /// a reason to withhold someone's entire edit. It comes back inside; the
+    /// file still opens.
+    #[test]
+    fn an_out_of_bounds_crop_is_pulled_back_rather_than_refused() {
+        let text = String::from_utf8(to_bytes(&nontrivial(), &view()).unwrap()).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        v["project"]["crop"] = serde_json::json!({"x": 100, "y": 20, "w": 99999, "h": 99999});
+        let back = from_str(&v.to_string()).expect("the edit is worth more than the crop");
+
+        // The source is 2560x1440 rotated 90°, so the picture is 1440x2560.
+        let crop = back.project.crop.unwrap();
+        assert_eq!((crop.x, crop.y, crop.w, crop.h), (100, 20, 1340, 2540));
+        back.project.validate().expect("repair leaves it valid");
+    }
+
+    /// The recovery snapshot goes through `from_str` too, and a half-flushed
+    /// autosave is exactly the input that is still valid JSON.
+    #[test]
+    fn a_truncated_snapshot_is_an_error_not_a_panic() {
+        let text = String::from_utf8(to_bytes(&nontrivial(), &view()).unwrap()).unwrap();
+        for cut in [text.len() / 4, text.len() / 2, text.len() - 1] {
+            assert!(from_str(&text[..cut]).is_err(), "truncated at {cut}");
+        }
+    }
+
     #[test]
     fn extensions() {
         assert_eq!(
@@ -319,6 +431,33 @@ mod tests {
         save(&path, &project, &view()).unwrap();
         let back = load(&path).unwrap();
         assert_eq!(back.project.segments, project.segments);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The bytes have to be on the disk before the rename names them, or a
+    /// power loss can leave a valid directory entry pointing at nothing. This
+    /// cannot test the power loss, so it tests the property that makes it
+    /// survivable: the file is complete and readable the instant `save`
+    /// returns, with no temp file still in flight.
+    #[test]
+    fn a_saved_file_is_complete_the_moment_the_write_returns() {
+        let dir = std::env::temp_dir().join("clip-project-file-durable");
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("edit.clip");
+
+        // A parent directory that does not exist yet is the recovery snapshot's
+        // situation on a first run.
+        let project = nontrivial();
+        save(&path, &project, &view()).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(
+            bytes,
+            to_bytes(&project, &view()).unwrap(),
+            "the file on disk is the whole file"
+        );
+        assert!(from_str(&String::from_utf8(bytes).unwrap()).is_ok());
+        assert!(!path.with_extension("clip.tmp").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

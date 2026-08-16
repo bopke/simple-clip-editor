@@ -91,11 +91,28 @@ impl Waveform {
         Ok(())
     }
 
+    /// Read peaks back from the cache.
+    ///
+    /// The bucket count is a number from a file, and a `peaks.bin` truncated by
+    /// a kill -9 — the exact thing a cache file is most likely to be — would
+    /// otherwise reserve whatever that number happened to say and abort the
+    /// process on the allocation. The file size is the cross-check: this format
+    /// is fixed-width, so the length is not a claim, it is arithmetic.
     pub fn load(path: &Path) -> Result<Waveform> {
-        let mut r = BufReader::new(File::open(path)?);
+        let file = File::open(path)?;
+        let size = file.metadata()?.len();
+        let mut r = BufReader::new(file);
         let mut len = [0u8; 8];
         r.read_exact(&mut len)?;
-        let len = u64::from_le_bytes(len) as usize;
+        let len = u64::from_le_bytes(len);
+        let expected = len.checked_mul(8).and_then(|b| b.checked_add(8));
+        if expected != Some(size) {
+            anyhow::bail!(
+                "{} claims {len} buckets but is {size} bytes — truncated or corrupt",
+                path.display()
+            );
+        }
+        let len = len as usize;
         let mut wf = Waveform {
             min: Vec::with_capacity(len),
             max: Vec::with_capacity(len),
@@ -210,6 +227,38 @@ mod tests {
         assert_eq!(back.min, wf.min);
         assert_eq!(back.max, wf.max);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// `peaks.bin` is a cache file, so the interesting case is the one a
+    /// crash leaves behind: a header that survived and a body that did not.
+    #[test]
+    fn a_truncated_peaks_file_is_an_error_not_an_allocation_abort() {
+        let dir = std::env::temp_dir().join("clip-editor-wf-truncated");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let wf = Waveform {
+            min: vec![-0.5; 4],
+            max: vec![0.5; 4],
+        };
+        let good = dir.join("peaks.bin");
+        wf.save(&good).unwrap();
+        assert_eq!(Waveform::load(&good).unwrap().buckets(), 4);
+
+        // Cut mid-body: the header still says four buckets.
+        let bytes = std::fs::read(&good).unwrap();
+        let cut = dir.join("cut.bin");
+        std::fs::write(&cut, &bytes[..bytes.len() - 9]).unwrap();
+        assert!(Waveform::load(&cut).unwrap_err().to_string().contains("4"));
+
+        // A length no allocator can honour must not be handed to one.
+        let absurd = dir.join("absurd.bin");
+        let mut bytes = u64::MAX.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&[0u8; 8]);
+        std::fs::write(&absurd, &bytes).unwrap();
+        assert!(Waveform::load(&absurd).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

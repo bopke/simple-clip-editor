@@ -64,12 +64,40 @@ impl SourceCache {
         self.dir.join("peaks.bin")
     }
 
+    fn thumbs_dir(&self) -> PathBuf {
+        self.dir.join("thumbs")
+    }
+
     pub fn thumb_pattern(&self) -> PathBuf {
-        self.dir.join("thumbs").join("thumb_%05d.jpg")
+        self.thumbs_dir().join("thumb_%05d.jpg")
+    }
+
+    /// Whether the strip on disk is the whole strip.
+    ///
+    /// "The directory has files in it" is not the same question: a run killed
+    /// halfway leaves N of M thumbnails, and treating that as done shows a
+    /// truncated strip on every future open of this source. The proxy and PCM
+    /// get this right by checking a single file for non-emptiness; a directory
+    /// filled one entry at a time needs something written at the end instead.
+    pub fn thumbs_complete(&self) -> bool {
+        self.thumbs_dir().join(".complete").exists()
+    }
+
+    /// Clear the strip and mark it unfinished, before generating it again.
+    pub fn begin_thumbs(&self) {
+        let dir = self.thumbs_dir();
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+    }
+
+    /// Mark the strip finished. Called only when ffmpeg exited cleanly and was
+    /// not cancelled — the marker is the claim that everything is here.
+    pub fn finish_thumbs(&self) {
+        let _ = fs::write(self.thumbs_dir().join(".complete"), b"");
     }
 
     pub fn thumbs(&self) -> Vec<PathBuf> {
-        let Ok(entries) = fs::read_dir(self.dir.join("thumbs")) else {
+        let Ok(entries) = fs::read_dir(self.thumbs_dir()) else {
             return Vec::new();
         };
         let mut out: Vec<PathBuf> = entries
@@ -261,6 +289,39 @@ mod tests {
         // An unparseable marker is the same situation as no marker at all.
         fs::write(used_marker(&dir), "not a timestamp").unwrap();
         assert!(last_used(&dir).is_some());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A run killed partway through the strip leaves files behind. Those are
+    /// not a finished strip, and the next open has to be able to tell.
+    #[test]
+    fn a_half_written_thumbnail_strip_does_not_read_as_finished() {
+        let dir = temp_dir("thumbs");
+        let cache = SourceCache { dir: dir.clone() };
+        cache.begin_thumbs();
+        assert!(!cache.thumbs_complete());
+
+        // ffmpeg got three of the frames out before it was killed.
+        for i in 1..=3 {
+            fs::write(dir.join("thumbs").join(format!("thumb_{i:05}.jpg")), b"x").unwrap();
+        }
+        assert_eq!(cache.thumbs().len(), 3);
+        assert!(
+            !cache.thumbs_complete(),
+            "files on disk are not the same claim as a finished strip"
+        );
+
+        // Starting again clears what was there rather than generating around it.
+        cache.begin_thumbs();
+        assert!(cache.thumbs().is_empty());
+        for i in 1..=5 {
+            fs::write(dir.join("thumbs").join(format!("thumb_{i:05}.jpg")), b"x").unwrap();
+        }
+        cache.finish_thumbs();
+        assert!(cache.thumbs_complete());
+        // The marker is not a thumbnail.
+        assert_eq!(cache.thumbs().len(), 5);
 
         let _ = fs::remove_dir_all(&dir);
     }

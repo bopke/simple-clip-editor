@@ -5,6 +5,11 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// A project that parsed but is not one this program could have written.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct Invalid(pub String);
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Project {
     pub source: SourceInfo,
@@ -108,6 +113,81 @@ impl Project {
 
     pub fn has_audio(&self) -> bool {
         !self.source.audio_streams.is_empty()
+    }
+
+    /// Fix what can be fixed about a project from outside this process.
+    ///
+    /// The split with [`validate`](Self::validate) is by what it costs to be
+    /// wrong. A zero denominator has no sane reading and every use of it is a
+    /// panic, so that file is refused. A crop hanging over the edge of the
+    /// picture has an obvious intended meaning, and refusing the file would
+    /// take away the user's whole edit to protect them from a filter argument —
+    /// so it is pulled back inside instead. Repair runs first; validate then
+    /// judges what is left.
+    pub fn repair(&mut self) {
+        let (w, h) = self.source.display_size();
+        if let Some(c) = self.crop.as_mut() {
+            if w == 0 || h == 0 {
+                self.crop = None;
+            } else {
+                c.x = c.x.min(w.saturating_sub(1));
+                c.y = c.y.min(h.saturating_sub(1));
+                c.w = c.w.clamp(1, w - c.x);
+                c.h = c.h.clamp(1, h - c.y);
+            }
+        }
+    }
+
+    /// Check the invariants the rest of the code assumes, for a project that
+    /// came from outside this process.
+    ///
+    /// Serde only proves the *shape* of a file. These are the properties the
+    /// model relies on and cannot state in the type: a frame rate that can be
+    /// divided by, a duration that is not negative, a crop that is inside the
+    /// picture. Every one of them is a panic or a nonsense export if it is
+    /// wrong, and project files get shared, so the check happens once at the
+    /// boundary rather than at every use.
+    pub fn validate(&self) -> Result<(), Invalid> {
+        fn positive(r: Rational, what: &str) -> Result<(), Invalid> {
+            if r.num <= 0 || r.den <= 0 {
+                return Err(Invalid(format!("{what} is {r:?}, which is not a rate")));
+            }
+            Ok(())
+        }
+
+        positive(self.project_fps, "the timeline frame rate")?;
+        if let Some(fps) = self.output.fps {
+            positive(fps, "the output frame rate")?;
+        }
+        if self.source.duration.is_negative() {
+            return Err(Invalid(format!(
+                "the source duration is {:?}",
+                self.source.duration
+            )));
+        }
+        for (i, s) in self.segments.iter().enumerate() {
+            if s.start.is_negative() || s.end < s.start {
+                return Err(Invalid(format!(
+                    "segment {i} is {:?}..{:?}",
+                    s.start, s.end
+                )));
+            }
+        }
+        if let Some(c) = self.crop {
+            let (w, h) = self.source.display_size();
+            let outside = c.w == 0 || c.h == 0;
+            // A source with no dimensions has nothing to be inside of; that is
+            // its own problem, not the crop's.
+            let past_edge =
+                w > 0 && h > 0 && (c.x.saturating_add(c.w) > w || c.y.saturating_add(c.h) > h);
+            if outside || past_edge {
+                return Err(Invalid(format!(
+                    "the crop {}x{}+{}+{} is not inside a {w}x{h} picture",
+                    c.w, c.h, c.x, c.y
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Mint fresh [`TrackId`]s for every added track.
@@ -727,6 +807,94 @@ mod tests {
         t.offset = RationalTime::new(5, 1);
         assert_eq!(t.delay_ms(), 5000);
         assert_eq!(t.effective_seek().unwrap().to_ffmpeg_arg(), "10.0");
+    }
+
+    /// What a project has to be for the rest of the code to be allowed to
+    /// assume it. Every one of these was a panic or a broken export.
+    #[test]
+    fn validation_names_what_the_model_cannot_use() {
+        let ok = Project::new(source());
+        assert!(ok.validate().is_ok());
+
+        let mut p = Project::new(source());
+        p.project_fps = Rational::ZERO;
+        assert!(p.validate().is_err(), "0 fps divides by zero");
+
+        let mut p = Project::new(source());
+        p.output.fps = Some(Rational::ZERO);
+        assert!(p.validate().is_err());
+
+        let mut p = Project::new(source());
+        p.source.duration = RationalTime::new(-1, 1);
+        assert!(p.validate().is_err());
+
+        let mut p = Project::new(source());
+        p.segments = vec![Segment {
+            start: RationalTime::new(5, 1),
+            end: RationalTime::new(1, 1),
+        }];
+        assert!(
+            p.validate().is_err(),
+            "a segment that ends before it starts"
+        );
+
+        // An empty segment is not a broken one — deleting everything is an
+        // edit, and `normalised_segments` already drops these.
+        let mut p = Project::new(source());
+        p.segments = vec![Segment {
+            start: RationalTime::ZERO,
+            end: RationalTime::ZERO,
+        }];
+        assert!(p.validate().is_ok());
+    }
+
+    /// Repair is for the values with an obvious intended meaning. Losing an
+    /// hour of trimming because a crop is twenty pixels too tall is a worse
+    /// outcome than the crop moving.
+    #[test]
+    fn a_crop_outside_the_picture_is_pulled_back_inside() {
+        let mut p = Project::new(source());
+        p.crop = Some(CropRect {
+            x: 100,
+            y: 20,
+            w: 5000,
+            h: 5000,
+        });
+        p.repair();
+        assert_eq!(
+            p.crop,
+            Some(CropRect {
+                x: 100,
+                y: 20,
+                w: 1820,
+                h: 1060
+            })
+        );
+        assert!(p.validate().is_ok(), "repair leaves a valid project");
+
+        // A source with no dimensions has nothing to be inside of.
+        let mut p = Project::new(SourceInfo::default());
+        p.crop = Some(CropRect {
+            x: 0,
+            y: 0,
+            w: 10,
+            h: 10,
+        });
+        p.repair();
+        assert_eq!(p.crop, None);
+        assert!(p.validate().is_ok());
+
+        // A valid crop is left exactly alone.
+        let mut p = Project::new(source());
+        let crop = CropRect {
+            x: 0,
+            y: 0,
+            w: 1920,
+            h: 1080,
+        };
+        p.crop = Some(crop);
+        p.repair();
+        assert_eq!(p.crop, Some(crop));
     }
 
     #[test]

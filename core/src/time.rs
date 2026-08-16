@@ -42,11 +42,59 @@ fn gcd(a: i64, b: i64) -> i64 {
     }
 }
 
+/// The largest magnitude a `num` or `den` may have when it arrives from a file.
+///
+/// Arithmetic here multiplies numerators by denominators in `i64`, so a pair of
+/// legitimate-looking but enormous values overflows — a panic in a debug build
+/// and a nonsense edit point in a release one. `2^50` is ~35 years at
+/// microsecond resolution, which is past anything anyone will trim.
+const MAX_MAGNITUDE: i64 = 1 << 50;
+
+/// A rational as it appears on disk, before any invariant has been checked.
+///
+/// Deserialising straight into [`Rational`] would accept `0/0`, which parses
+/// fine and then divides by zero the first time it is used as a frame rate.
+#[derive(Deserialize)]
+struct RationalRepr {
+    num: i64,
+    den: i64,
+}
+
+impl RationalRepr {
+    /// The invariants every constructor upholds: positive denominator, reduced
+    /// to lowest terms, small enough to do arithmetic with. Every value written
+    /// by this program satisfies these, so rejecting rather than repairing
+    /// keeps a single representation per value — which is what lets the derived
+    /// `PartialEq` agree with [`RationalTime::cmp_time`].
+    fn checked(self) -> Result<(i64, i64), String> {
+        let (num, den) = (self.num, self.den);
+        if den == 0 {
+            return Err(format!("{num}/{den} has a zero denominator"));
+        }
+        if num.abs() > MAX_MAGNITUDE || den.abs() > MAX_MAGNITUDE {
+            return Err(format!("{num}/{den} is too large to be a time or a rate"));
+        }
+        if den < 0 || gcd(num, den) != 1 {
+            return Err(format!("{num}/{den} is not in lowest terms"));
+        }
+        Ok((num, den))
+    }
+}
+
 /// A rational number, kept normalised with a positive denominator.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RationalRepr")]
 pub struct Rational {
     pub num: i64,
     pub den: i64,
+}
+
+impl TryFrom<RationalRepr> for Rational {
+    type Error = String;
+    fn try_from(repr: RationalRepr) -> Result<Rational, String> {
+        let (num, den) = repr.checked()?;
+        Ok(Rational { num, den })
+    }
 }
 
 impl Default for Rational {
@@ -194,9 +242,18 @@ impl fmt::Display for Rational {
 
 /// Exact time in seconds. Never use `f64` for edit points.
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RationalRepr")]
 pub struct RationalTime {
     pub num: i64,
     pub den: i64,
+}
+
+impl TryFrom<RationalRepr> for RationalTime {
+    type Error = String;
+    fn try_from(repr: RationalRepr) -> Result<RationalTime, String> {
+        let (num, den) = repr.checked()?;
+        Ok(RationalTime { num, den })
+    }
 }
 
 impl RationalTime {
@@ -392,6 +449,57 @@ impl FrameIdx {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `0/0` is valid JSON and, before this, a valid `Rational` — which then
+    /// divided by zero the first time it was used as a frame rate. Validation
+    /// belongs at the edge, not at every use.
+    #[test]
+    fn a_degenerate_rational_is_refused_at_the_edge() {
+        let bad = |s: &str| serde_json::from_str::<Rational>(s).unwrap_err().to_string();
+        assert!(bad(r#"{"num":0,"den":0}"#).contains("zero denominator"));
+        assert!(bad(r#"{"num":30,"den":0}"#).contains("zero denominator"));
+        // Two ways of writing 1/2 would break the derived PartialEq.
+        assert!(bad(r#"{"num":2,"den":4}"#).contains("lowest terms"));
+        assert!(bad(r#"{"num":-1,"den":-2}"#).contains("lowest terms"));
+        // Big enough to overflow the i64 arithmetic downstream.
+        assert!(bad(r#"{"num":9223372036854775807,"den":1}"#).contains("too large"));
+
+        let good: Rational = serde_json::from_str(r#"{"num":30000,"den":1001}"#).unwrap();
+        assert_eq!(good, Rational::new(30000, 1001));
+        let t: RationalTime = serde_json::from_str(r#"{"num":-3,"den":2}"#).unwrap();
+        assert_eq!(t, RationalTime::new(-3, 2));
+        assert!(serde_json::from_str::<RationalTime>(r#"{"num":1,"den":0}"#).is_err());
+    }
+
+    /// Everything the model can produce survives the round trip the check
+    /// above is strict about.
+    #[test]
+    fn normalised_values_round_trip_through_serde() {
+        let values = [
+            Rational::ZERO,
+            Rational::from_int(60),
+            Rational::new(30000, 1001),
+            Rational::new(4, -8),
+            Rational::new(0, 5),
+        ];
+        for v in values {
+            let text = serde_json::to_string(&v).unwrap();
+            assert_eq!(serde_json::from_str::<Rational>(&text).unwrap(), v, "{v:?}");
+        }
+        for t in [
+            RationalTime::ZERO,
+            RationalTime::new(3607, 2),
+            RationalTime::from_millis(-1500),
+            RationalTime::from_seconds_f64(90.125),
+        ] {
+            let text = serde_json::to_string(&t).unwrap();
+            assert_eq!(
+                serde_json::from_str::<RationalTime>(&text).unwrap(),
+                t,
+                "{t:?}"
+            );
+        }
+    }
 
     #[test]
     fn rational_normalises() {

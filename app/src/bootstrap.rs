@@ -187,9 +187,12 @@ pub fn install(
     let total = total_download_bytes();
     let mut done = 0u64;
 
-    let tmp = dir.join("download.tmp");
     for d in downloads() {
-        let digest = fetch(d.url, &tmp, &should_continue, |chunk| {
+        // Named after the URL, not a fixed `download.tmp`: macOS fetches two
+        // archives and a second copy of the app may be doing the same thing at
+        // the same time, and two writers on one path corrupt both downloads.
+        let tmp = TempFile::new(dir.join(format!("{}.part", temp_stem(d.url))));
+        let digest = fetch(d.url, &tmp.path, d.size, &should_continue, |chunk| {
             done += chunk;
             on_progress(DownloadProgress {
                 done_bytes: done.min(total),
@@ -199,7 +202,6 @@ pub fn install(
         // Verify before extracting: running an unexpected binary is worse than
         // failing, so a mismatch fails loudly.
         if !digest.eq_ignore_ascii_case(d.sha256) {
-            let _ = fs::remove_file(&tmp);
             bail!(
                 "checksum mismatch for {}\n  expected {}\n  got      {}",
                 d.url,
@@ -207,8 +209,7 @@ pub fn install(
                 digest
             );
         }
-        extract(&tmp, &dir).with_context(|| format!("extracting {}", d.url))?;
-        let _ = fs::remove_file(&tmp);
+        extract(&tmp.path, &dir).with_context(|| format!("extracting {}", d.url))?;
     }
 
     make_executable(&dir)?;
@@ -224,28 +225,98 @@ pub fn install(
     Ok(tools)
 }
 
+/// A scratch file that is removed however its scope is left.
+///
+/// A `?` on the extract path used to skip the `remove_file` on the line below
+/// it and leave 168 MB in the data directory, where nothing ever collects it.
+struct TempFile {
+    path: PathBuf,
+}
+
+impl TempFile {
+    fn new(path: PathBuf) -> TempFile {
+        TempFile { path }
+    }
+}
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// A filename derived from the URL, so two archives fetched in one run — and
+/// two copies of the app fetching at once — do not land on the same path.
+fn temp_stem(url: &str) -> String {
+    let tail = url.rsplit('/').next().unwrap_or("download");
+    let stem: String = tail
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        .collect();
+    // `.` and `..` survive the filter and are directories, not names.
+    if stem.is_empty() || stem.chars().all(|c| c == '.') {
+        "download".to_string()
+    } else {
+        stem
+    }
+}
+
+/// How much larger than the pinned size a response may be before it is refused.
+///
+/// The size is pinned alongside the checksum, so anything materially bigger is
+/// either the wrong artifact or a server that will happily stream until the
+/// disk is full. Small slack absorbs a vendor re-packing the same build.
+const SIZE_SLACK: u64 = 4 * 1024 * 1024;
+
+/// Timeouts for the download.
+///
+/// A stalled connection with no deadline hangs the bootstrap thread, and the
+/// only way out is a cancel button the user has to know to press. `ureq`'s
+/// timeouts are deadlines rather than idle timers, so the body one has to be
+/// generous — it is a >100 MB file and someone is on hotel wifi — while the
+/// handshake ones can be short, because that is where a dead host shows up.
+fn agent() -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .timeout_resolve(Some(std::time::Duration::from_secs(30)))
+        .timeout_connect(Some(std::time::Duration::from_secs(30)))
+        .timeout_send_request(Some(std::time::Duration::from_secs(30)))
+        .timeout_recv_response(Some(std::time::Duration::from_secs(60)))
+        .timeout_recv_body(Some(std::time::Duration::from_secs(30 * 60)))
+        .build()
+        .into()
+}
+
 fn fetch(
     url: &str,
     dest: &Path,
+    expected_size: u64,
     should_continue: &impl Fn() -> bool,
     mut on_chunk: impl FnMut(u64),
 ) -> Result<String> {
-    let mut response = ureq::get(url)
+    let mut response = agent()
+        .get(url)
         .call()
         .with_context(|| format!("requesting {url}"))?;
     let mut reader = response.body_mut().as_reader();
     let mut file = File::create(dest).with_context(|| format!("writing {}", dest.display()))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 128 * 1024];
+    let ceiling = expected_size.saturating_add(SIZE_SLACK);
+    let mut written = 0u64;
     loop {
         if !should_continue() {
-            drop(file);
-            let _ = fs::remove_file(dest);
             bail!("cancelled");
         }
         let n = reader.read(&mut buf).context("reading download")?;
         if n == 0 {
             break;
+        }
+        written += n as u64;
+        if written > ceiling {
+            bail!(
+                "{url} is larger than the pinned {expected_size} bytes — refusing to \
+                 keep downloading"
+            );
         }
         hasher.update(&buf[..n]);
         file.write_all(&buf[..n])?;
@@ -311,15 +382,17 @@ fn extract_zip(file: File, dest: &Path) -> Result<()> {
 
 fn extract_tar_xz(mut file: File, dest: &Path, archive: &Path) -> Result<()> {
     // Decompress to a sibling temp file rather than into memory; these
-    // archives are >100 MB compressed.
-    let tar_path = archive.with_extension("tar");
+    // archives are >100 MB compressed. The guard matters as much here as on the
+    // download: a failed xz decode leaves the largest file the app ever writes.
+    let tar = TempFile::new(archive.with_extension("tar"));
+    let tar_path = tar.path.clone();
     {
         let mut reader = io::BufReader::new(&mut file);
         let mut out = io::BufWriter::new(File::create(&tar_path)?);
         lzma_rs::xz_decompress(&mut reader, &mut out).map_err(|e| anyhow!("xz decode: {e:?}"))?;
         out.flush()?;
     }
-    let result = (|| -> Result<()> {
+    (|| -> Result<()> {
         let mut tar = tar::Archive::new(File::open(&tar_path)?);
         for entry in tar.entries()? {
             let mut entry = entry?;
@@ -335,9 +408,7 @@ fn extract_tar_xz(mut file: File, dest: &Path, archive: &Path) -> Result<()> {
             io::copy(&mut entry, &mut f)?;
         }
         Ok(())
-    })();
-    let _ = fs::remove_file(&tar_path);
-    result
+    })()
 }
 
 #[cfg(unix)]
@@ -434,6 +505,61 @@ mod tests {
         assert!(wanted("ffprobe.exe"));
         assert!(!wanted("ffplay"));
         assert!(!wanted("README.txt"));
+    }
+
+    /// macOS fetches two archives in one run, and a second copy of the app may
+    /// be fetching at the same moment. One fixed `download.tmp` for all of them
+    /// is two writers on one path.
+    #[test]
+    fn each_download_gets_its_own_temp_name() {
+        let names: Vec<String> = downloads().iter().map(|d| temp_stem(d.url)).collect();
+        for (i, a) in names.iter().enumerate() {
+            for b in &names[i + 1..] {
+                assert_ne!(a, b, "two downloads share a temp file");
+            }
+        }
+        assert_eq!(temp_stem("https://host/dir/ffmpeg.zip"), "ffmpeg.zip");
+        // Only the last component, and only characters that are a filename —
+        // nothing from a URL becomes a path traversal or a shell surprise.
+        assert_eq!(temp_stem("https://host/../../etc/pa$$wd"), "pawd");
+        assert_eq!(temp_stem("https://host/dir/.."), "download");
+        assert_eq!(temp_stem("https://host/"), "download");
+    }
+
+    /// The temp file has to go whichever way the scope is left — the original
+    /// bug was a `?` on extraction skipping the cleanup on the next line.
+    #[test]
+    fn the_temp_file_is_removed_even_when_extraction_fails() {
+        let dir = std::env::temp_dir().join("clip-editor-tempfile-test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.part");
+
+        let err = (|| -> Result<()> {
+            let tmp = TempFile::new(path.clone());
+            fs::write(&tmp.path, b"not an archive")?;
+            assert!(tmp.path.exists());
+            extract(&tmp.path, &dir)?;
+            Ok(())
+        })();
+        assert!(err.is_err());
+        assert!(!path.exists(), "a failed run left its scratch file behind");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A pinned size is a ceiling as well as a progress denominator; without
+    /// one, a misbehaving server streams until the disk is full.
+    #[test]
+    fn the_size_ceiling_is_close_to_the_pinned_size() {
+        for d in downloads() {
+            let ceiling = d.size + SIZE_SLACK;
+            assert!(
+                ceiling < d.size * 2,
+                "{} would accept twice what it pinned",
+                d.url
+            );
+        }
     }
 
     /// A failed extraction has to say *which file*: the caller only knows the

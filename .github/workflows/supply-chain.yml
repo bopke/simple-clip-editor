@@ -1,0 +1,35 @@
+name: Supply chain
+
+# Nothing in the tree tells you when one of ~500 transitive dependencies picks
+# up an advisory, and an app that decodes untrusted media is not the place to
+# find out late. This runs on dependency changes and on a schedule, because the
+# advisory can appear on a day nobody touched the code.
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "**/Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/supply-chain.yml"
+  push:
+    branches: [main]
+  schedule:
+    # Mondays, early. A weekly floor on how stale the answer can get.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: supply-chain-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans sources licenses

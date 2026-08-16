@@ -101,9 +101,11 @@ fn a_saved_project_reopens_as_the_same_edit() {
         Segment::from_frames(FrameIdx(37), FrameIdx(451), fps()),
         Segment::from_frames(FrameIdx(900), FrameIdx(1802), fps()),
     ];
+    // Inside the 1920x1080 source: a crop hanging over the edge is repaired on
+    // load, which would make this a test of the repair rather than of the trip.
     let crop = CropRect {
         x: 100,
-        y: 20,
+        y: 0,
         w: 608,
         h: 1080,
     };

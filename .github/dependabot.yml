@@ -1,0 +1,24 @@
+version: 2
+
+# Weekly and grouped, deliberately. Ungrouped daily bumps on a tree this size
+# produce more pull requests than anyone reads, and a review nobody does is not
+# a supply-chain control. Security updates are the exception and come through
+# on their own, immediately.
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      patch-and-minor:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]

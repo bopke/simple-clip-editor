@@ -84,10 +84,16 @@ pub fn run_import(tools: Tools, project: Project, cache: SourceCache, tx: Tx, ca
         }
         if cache.has(&pcm_path) {
             let peaks_path = cache.peaks();
-            let waveform = if cache.has(&peaks_path) {
-                Waveform::load(&peaks_path).ok()
-            } else {
-                match Waveform::compute(&pcm_path) {
+            // A cached peaks file that will not load is a damaged one, not a
+            // reason to go without a waveform: the PCM it was derived from is
+            // right here, so rebuild rather than remember the damage forever.
+            let cached = cache
+                .has(&peaks_path)
+                .then(|| Waveform::load(&peaks_path).ok())
+                .flatten();
+            let waveform = match cached {
+                Some(w) => Some(w),
+                None => match Waveform::compute(&pcm_path) {
                     Ok(w) => {
                         let _ = w.save(&peaks_path);
                         Some(w)
@@ -96,7 +102,7 @@ pub fn run_import(tools: Tools, project: Project, cache: SourceCache, tx: Tx, ca
                         let _ = tx.send(Msg::Error(format!("waveform failed: {e}")));
                         None
                     }
-                }
+                },
             };
             if let Some(w) = waveform {
                 let _ = tx.send(Msg::WaveformReady(Arc::new(w)));
@@ -117,10 +123,19 @@ pub fn run_import(tools: Tools, project: Project, cache: SourceCache, tx: Tx, ca
     }
 
     // --- thumbnail strip ------------------------------------------------
-    if cache.thumbs().is_empty() {
+    // A strip is regenerated unless it is marked complete: "there are files in
+    // the directory" would accept the half-written strip a killed run leaves,
+    // and then show it forever. What is on disk is still sent to the UI below —
+    // a partial strip beats none for this session, it just is not trusted for
+    // the next one.
+    if !cache.thumbs_complete() {
         let _ = tx.send(Msg::Status("Rendering thumbnails…".into()));
+        cache.begin_thumbs();
         let args = command::thumbnail_args(&project, &cache.thumb_pattern());
-        let _ = tools.run_with_progress(&args, &cancel, |_| {});
+        let done = tools.run_with_progress(&args, &cancel, |_| {}).is_ok();
+        if done && !cancel.is_cancelled() {
+            cache.finish_thumbs();
+        }
     }
     if !cancel.is_cancelled() {
         let _ = tx.send(Msg::ThumbsReady(cache.thumbs()));

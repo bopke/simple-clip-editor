@@ -1,0 +1,46 @@
+# cargo-deny configuration.
+#
+# The tree is ~500 transitive crates and it decodes untrusted media, so
+# "nothing in Cargo.lock is advisory-flagged" needs to be something CI asserts
+# rather than something someone remembers to check. Cargo.lock is committed,
+# which is what makes the answer reproducible.
+
+[advisories]
+# Anything with a published advisory fails the build. Individual exceptions go
+# in `ignore` below, each with a note saying why it does not reach us — an
+# unexplained id here is how an advisory becomes permanent.
+yanked = "deny"
+ignore = []
+
+[bans]
+# Two versions of the same crate is a warning, not a failure: with eframe,
+# image and zip in the tree it is routine and outside our control.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[licenses]
+# The app is GPL-3.0-or-later, so a copyleft dependency is fine; what is not
+# fine is a dependency with no license or one we cannot ship under.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "GPL-2.0",
+    "GPL-3.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "OFL-1.1",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.9
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
