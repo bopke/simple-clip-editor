@@ -345,3 +345,87 @@ fn exporting_over_an_existing_file_asks_first() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// -- who owns the keyboard --------------------------------------------------
+
+/// Shortcuts used to run straight through whatever was on screen: Space
+/// toggling playback under the export dialog, `X` deleting a range under it.
+/// A dialog owns the keyboard while it is up.
+#[test]
+fn the_export_dialog_owns_the_keyboard_while_it_is_open() {
+    let ctx = egui::Context::default();
+    let mut app = test_app(&ctx);
+    project(&mut app);
+    app.playhead = FrameIdx(30);
+    app.selection = Some((FrameIdx(10), FrameIdx(20)));
+    let segments = app.project.as_ref().unwrap().segments.clone();
+
+    frame(&mut app, &ctx, key(egui::Key::E, egui::Modifiers::COMMAND));
+    assert!(app.show_export);
+    assert_eq!(
+        app.active_dialog(),
+        Some(clip_editor::app::Dialog::Export),
+        "the dialog on screen is the one holding the keyboard"
+    );
+
+    // The destructive one first: this is the key the plan called out.
+    frame(&mut app, &ctx, key(egui::Key::X, egui::Modifiers::NONE));
+    assert_eq!(
+        app.project.as_ref().unwrap().segments,
+        segments,
+        "X deleted a range under the export dialog"
+    );
+    assert!(!app.unsaved, "and it counted as an edit");
+
+    // And the harmless-looking one.
+    frame(&mut app, &ctx, key(egui::Key::Space, egui::Modifiers::NONE));
+    assert!(!app.player.is_playing(), "Space started playback under it");
+
+    // Nor do the in/out points move.
+    frame(&mut app, &ctx, key(egui::Key::I, egui::Modifiers::NONE));
+    frame(&mut app, &ctx, key(egui::Key::C, egui::Modifiers::NONE));
+    assert_eq!(app.project.as_ref().unwrap().segments, segments);
+    assert!(!app.crop_tool);
+
+    // Esc is the one key it does answer to, and the editor gets the keyboard
+    // back afterwards.
+    frame(
+        &mut app,
+        &ctx,
+        key(egui::Key::Escape, egui::Modifiers::NONE),
+    );
+    assert!(!app.show_export);
+    assert_eq!(app.active_dialog(), None);
+    frame(&mut app, &ctx, key(egui::Key::C, egui::Modifiers::NONE));
+    assert!(app.crop_tool, "shortcuts work again once it is closed");
+}
+
+/// The recovery notice answers to nothing at all. Restoring and discarding are
+/// both real answers, and a stray Esc guessing one is how the unsaved work it
+/// exists to protect gets thrown away.
+#[test]
+fn the_recovery_notice_does_not_answer_to_escape() {
+    let ctx = egui::Context::default();
+    let mut app = test_app(&ctx);
+    project(&mut app);
+    // Stand in for a snapshot found at startup without touching the real one.
+    app.pending_recovery = None;
+    assert_eq!(app.active_dialog(), None);
+
+    // With a discard confirmation up instead — which does have a safe way out
+    // — Esc backs out and changes nothing.
+    app.unsaved = true;
+    app.open_path("/no/such/video.mkv".into());
+    assert_eq!(
+        app.active_dialog(),
+        Some(clip_editor::app::Dialog::ConfirmDiscard)
+    );
+    frame(
+        &mut app,
+        &ctx,
+        key(egui::Key::Escape, egui::Modifiers::NONE),
+    );
+    assert_eq!(app.active_dialog(), None, "Esc cancels the open");
+    assert!(app.unsaved, "and leaves the edit exactly as it was");
+    assert!(app.project.is_some());
+}

@@ -28,52 +28,52 @@ fn export_confirm(app: &mut App, ctx: &egui::Context) {
     let mut go = false;
     let mut cancel = false;
     let mut choose = false;
-    egui::Window::new("Before exporting")
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-        .show(ctx, |ui| {
-            ui.set_max_width(460.0);
+    // A question, so it blocks: unlike the export dialog behind it, this is
+    // momentary and there is nothing useful to do until it is answered.
+    egui::Modal::new(egui::Id::new("export-confirm")).show(ctx, |ui| {
+        ui.set_max_width(460.0);
+        ui.heading("Before exporting");
+        ui.add_space(4.0);
 
-            if let Some(bytes) = checks.overwrite {
-                ui.label(format!(
-                    "A file is already there and will be replaced ({}):",
-                    crate::disk::human_bytes(bytes)
-                ));
-                ui.label(RichText::new(&path).monospace().size(10.0));
-                ui.add_space(6.0);
-            }
+        if let Some(bytes) = checks.overwrite {
+            ui.label(format!(
+                "A file is already there and will be replaced ({}):",
+                crate::disk::human_bytes(bytes)
+            ));
+            ui.label(RichText::new(&path).monospace().size(10.0));
+            ui.add_space(6.0);
+        }
 
-            for warning in &checks.tight {
-                ui.label(
-                    RichText::new(format!(
-                        "Not enough room for {} on {}: about {} needed, {} free.",
-                        warning.what,
-                        warning.path.display(),
-                        crate::disk::human_bytes(warning.needed),
-                        crate::disk::human_bytes(warning.available),
-                    ))
-                    .color(Color32::from_rgb(240, 190, 140)),
-                );
-            }
-            if !checks.tight.is_empty() {
-                ui.label(
-                    RichText::new(
-                        "The size is an estimate from the source file — the encode may \
+        for warning in &checks.tight {
+            ui.label(
+                RichText::new(format!(
+                    "Not enough room for {} on {}: about {} needed, {} free.",
+                    warning.what,
+                    warning.path.display(),
+                    crate::disk::human_bytes(warning.needed),
+                    crate::disk::human_bytes(warning.available),
+                ))
+                .color(Color32::from_rgb(240, 190, 140)),
+            );
+        }
+        if !checks.tight.is_empty() {
+            ui.label(
+                RichText::new(
+                    "The size is an estimate from the source file — the encode may \
                          come out smaller.",
-                    )
-                    .size(11.0)
-                    .color(Color32::from_gray(150)),
-                );
-            }
+                )
+                .size(11.0)
+                .color(Color32::from_gray(150)),
+            );
+        }
 
-            ui.add_space(8.0);
-            ui.horizontal(|ui| {
-                go = ui.button("Export anyway").clicked();
-                choose = ui.button("Choose another file…").clicked();
-                cancel = ui.button("Cancel").clicked();
-            });
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            go = ui.button("Export anyway").clicked();
+            choose = ui.button("Choose another file…").clicked();
+            cancel = ui.button("Cancel").clicked();
         });
+    });
 
     if go {
         let ctx = ctx.clone();
@@ -179,6 +179,14 @@ fn discard_confirm(app: &mut App, ctx: &egui::Context) {
     }
 }
 
+/// A window rather than a modal, deliberately.
+///
+/// This stays open while the export runs — the progress bar and the cancel
+/// button are in here — and blocking the editor behind it for a twenty-minute
+/// encode would be worse than anything modality buys. It still owns the
+/// *keyboard* while it is up (see [`crate::app::Dialog`]), so Space does not
+/// toggle playback and `X` does not delete a range under it; Esc closes it and
+/// leaves any running export alone.
 fn export_dialog(app: &mut App, ctx: &egui::Context) {
     if !app.show_export {
         return;

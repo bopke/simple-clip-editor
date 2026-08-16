@@ -2,7 +2,7 @@
 //! because your hands don't leave the keyboard, so this is wired in from the
 //! start rather than retrofitted onto mouse-centric code.
 
-use crate::app::App;
+use crate::app::{App, Dialog};
 use clip_core::{edits, FrameIdx, RationalTime};
 use egui::Key;
 
@@ -29,13 +29,6 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
     if ctx.egui_wants_keyboard_input() {
         return;
     }
-    // A blocking question is on screen. `egui::Modal`'s backdrop stops the
-    // pointer and nothing else, so without this the shortcuts behind it stay
-    // live — and Ctrl+O during the recovery notice would throw away the very
-    // edit being offered back, which is what the notice exists to prevent.
-    if app.pending_recovery.is_some() || app.confirm_discard.is_some() {
-        return;
-    }
     // Modifiers come from the event, not from the global input state: the
     // two can disagree, and the event is what the user actually pressed.
     let pressed: Vec<(Key, egui::Modifiers)> = ctx.input(|i| {
@@ -53,13 +46,22 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
             .collect()
     });
 
+    // A dialog is up, and it owns the keyboard. Without this the editor's
+    // shortcuts stay live behind it: Ctrl+O during the recovery notice throws
+    // away the very edit being offered back, and `X` under the export dialog
+    // deletes a range nobody was looking at. See [`Dialog`].
+    if let Some(dialog) = app.active_dialog() {
+        dialog_keys(app, dialog, &pressed);
+        return;
+    }
+
     for (key, mods) in pressed {
         match key {
             Key::Escape => {
+                // The export dialog is handled by `dialog_keys`; by the time
+                // Esc reaches here there is no dialog to close.
                 if app.crop_drag.take().is_none() {
-                    if app.show_export {
-                        app.show_export = false;
-                    } else if app.export_job.is_some() {
+                    if app.export_job.is_some() {
                         app.cancel_export();
                     } else {
                         app.crop_tool = false;
@@ -122,6 +124,26 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
             Key::C => app.crop_tool = !app.crop_tool,
             _ => {}
         }
+    }
+}
+
+/// The keys a dialog answers to. Everything else is swallowed while it is up.
+///
+/// Only Esc, and only where backing out is a real answer. The recovery notice
+/// is deliberately absent: restoring and discarding are both decisions, and
+/// guessing one because a key was pressed is how the unsaved work this whole
+/// mechanism exists to protect gets thrown away.
+fn dialog_keys(app: &mut App, dialog: Dialog, pressed: &[(Key, egui::Modifiers)]) {
+    if !pressed.iter().any(|(k, _)| *k == Key::Escape) {
+        return;
+    }
+    match dialog {
+        Dialog::Recovery => {}
+        Dialog::ConfirmDiscard => app.cancel_pending_open(),
+        Dialog::ConfirmExport => app.export_confirm = None,
+        // The dialog closes; an export already running carries on, with its
+        // progress and its cancel button still in the sidebar.
+        Dialog::Export => app.show_export = false,
     }
 }
 

@@ -54,6 +54,40 @@ pub enum Control {
     Crf,
 }
 
+/// A dialog that owns the keyboard while it is up.
+///
+/// # Why this exists rather than "make the dialogs modal"
+///
+/// `egui::Modal` blocks the pointer and nothing else, so a modal alone leaves
+/// every shortcut live behind it — Space toggling playback under the export
+/// dialog, `X` deleting a range under a prompt. And modality is the wrong tool
+/// for the export dialog in particular: it stays open *while the export runs*,
+/// showing progress and the cancel button, so blocking the window behind it
+/// would freeze the app for a twenty-minute encode.
+///
+/// So the pointer and the keyboard are answered separately. A dialog that
+/// needs an answer takes the keyboard; whether it also blocks the pointer is
+/// its own decision. Notifications — the HDR notice, the error toast — are not
+/// here: they appear on their own without being asked for, and taking the
+/// keyboard away from someone who did not open them is worse than the stray
+/// keystroke.
+///
+/// Naming them one at a time in `keys::handle` was fine for two. This is the
+/// point at which a third would have made it a pattern.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Dialog {
+    /// Unsaved work from a previous session. No Esc: restoring and discarding
+    /// are both real answers and there is no safe default to assume.
+    Recovery,
+    /// "Opening this discards unsaved changes". Esc cancels the open.
+    ConfirmDiscard,
+    /// "This export will replace a file / may not fit". Esc cancels it.
+    ConfirmExport,
+    /// The export dialog. Esc closes it — and an export already running keeps
+    /// running, with its progress in the sidebar.
+    Export,
+}
+
 /// An open that is waiting on the user, because taking it would throw away
 /// unsaved work.
 ///
@@ -328,6 +362,25 @@ impl App {
             self.open_project_path(path);
         } else {
             self.import_source(path);
+        }
+    }
+
+    /// Which dialog owns the keyboard, if any.
+    ///
+    /// In the order they are stacked, so the answer is the one on top: the
+    /// recovery notice is shown before anything else can be opened, and a
+    /// confirmation sits over the dialog that raised it.
+    pub fn active_dialog(&self) -> Option<Dialog> {
+        if self.pending_recovery.is_some() {
+            Some(Dialog::Recovery)
+        } else if self.confirm_discard.is_some() {
+            Some(Dialog::ConfirmDiscard)
+        } else if self.export_confirm.is_some() {
+            Some(Dialog::ConfirmExport)
+        } else if self.show_export {
+            Some(Dialog::Export)
+        } else {
+            None
         }
     }
 
