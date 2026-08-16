@@ -22,6 +22,15 @@ fn main() {
     );
 
     // Rebuild when the checked-out commit changes.
+    //
+    // This deliberately does not keep `CLIP_GIT_DIRTY` exact. Editing a tracked
+    // file without staging it touches neither `.git/HEAD` nor `.git/index`, so
+    // a build from before the edit keeps its clean marker until something else
+    // triggers a rebuild. Making it exact would mean rerunning this script on
+    // every cargo invocation and rebuilding the crate whenever any tracked file
+    // changed — a real cost on every build to keep a `+` honest on developer
+    // builds only. Released builds come from a clean CI checkout, where the
+    // marker is always absent and always right.
     for path in [".git/HEAD", "../.git/HEAD", "../.git/index"] {
         if std::path::Path::new(path).exists() {
             println!("cargo:rerun-if-changed={path}");

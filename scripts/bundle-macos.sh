@@ -22,7 +22,29 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cargo build --release -p clip-editor
 cp "$BIN" "$APP/Contents/MacOS/clip-editor"
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+# Version identity, mirroring app/build.rs: the commit is the version, so
+# nothing here is hardcoded and the plist cannot drift from the binary.
+# A trailing `+` means the tree had uncommitted changes, exactly as in the
+# window title.
+SHORT=$(git rev-parse --short=7 HEAD 2>/dev/null || true)
+if [ -z "$SHORT" ] && [ -n "${GITHUB_SHA:-}" ]; then
+  SHORT=${GITHUB_SHA:0:7}
+fi
+SHORT=${SHORT:-dev}
+if [ -n "$(git status --porcelain --untracked-files=no 2>/dev/null || true)" ]; then
+  SHORT="${SHORT}+"
+fi
+
+# CFBundleVersion is the one key macOS reads as an ordered *number*:
+# LaunchServices compares it to decide which of two installed copies of a
+# bundle id is newer. A hash there would sort arbitrarily, so it gets the
+# commit's unix timestamp — monotonic along a linear main, numeric, and
+# still derived from the commit rather than invented. Not `rev-list --count`,
+# which returns 1 in the shallow clones CI checks out.
+BUILD=$(git log -1 --format=%ct 2>/dev/null || true)
+BUILD=${BUILD:-0}
+
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -31,8 +53,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleName</key>              <string>Clip Editor</string>
   <key>CFBundleDisplayName</key>       <string>Clip Editor</string>
   <key>CFBundleIdentifier</key>        <string>net.clipeditor.app</string>
-  <key>CFBundleVersion</key>           <string>0.1.0</string>
-  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>CFBundleVersion</key>           <string>${BUILD}</string>
+  <key>CFBundleShortVersionString</key><string>${SHORT}</string>
   <key>CFBundleExecutable</key>        <string>clip-editor</string>
   <key>CFBundlePackageType</key>       <string>APPL</string>
   <key>LSMinimumSystemVersion</key>    <string>11.0</string>
