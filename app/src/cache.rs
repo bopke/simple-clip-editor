@@ -87,8 +87,20 @@ impl SourceCache {
         fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false)
     }
 
+    /// Record that this source was opened, so [`cleanup`] keeps it.
+    ///
+    /// The timestamp is the marker's *contents*, not any filesystem timestamp.
+    /// The directory's mtime does not move when a file inside it is rewritten
+    /// (only when an entry is added or removed), which is what made the
+    /// previous version of this effective exactly once — on first import — and
+    /// never again. Writing seconds into the file keeps the writer and
+    /// [`last_used`] talking about the same thing, on every filesystem.
     pub fn touch(&self) {
-        let _ = fs::write(self.dir.join(".used"), b"");
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = fs::write(used_marker(&self.dir), now.to_string());
     }
 }
 
@@ -134,7 +146,36 @@ impl Drop for ExportTemp {
     }
 }
 
+fn used_marker(dir: &Path) -> PathBuf {
+    dir.join(".used")
+}
+
+/// When this source was last opened.
+///
+/// Falls back to the directory's own mtime when the marker is missing or
+/// unreadable — caches written by an older build have no marker, and treating
+/// those as brand new would leak them forever while treating them as ancient
+/// would delete a proxy someone is about to use. `atime` is deliberately not
+/// consulted: `relatime` and `noatime` mounts make it unreliable to the point
+/// of being misleading.
+fn last_used(dir: &Path) -> Option<SystemTime> {
+    if let Ok(text) = fs::read_to_string(used_marker(dir)) {
+        if let Ok(secs) = text.trim().parse::<u64>() {
+            return Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs));
+        }
+    }
+    fs::metadata(dir).and_then(|m| m.modified()).ok()
+}
+
 /// Remove stale artifacts. Called at startup and again on exit.
+///
+/// Safe to run twice in quick succession — removal is idempotent, and the
+/// second pass simply sees fewer entries. Safe with two copies of the app open,
+/// with one caveat worth knowing: an entry is only kept alive by [`touch`] at
+/// import, so a second copy that has held a source open for longer than
+/// `MAX_AGE` can have its cache removed from under it. The files it already
+/// opened survive on unix, and on Windows the removal fails and is ignored;
+/// either way the worst case is a rebuilt proxy, not a wrong result.
 pub fn cleanup() {
     let Ok(root) = cache_root() else { return };
     // Export intermediates are never worth keeping across runs.
@@ -146,10 +187,9 @@ pub fn cleanup() {
     let now = SystemTime::now();
     for entry in entries.flatten() {
         let path = entry.path();
-        let age = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
+        // A marker from the future (clock skew, a restored backup) yields no
+        // age rather than a huge one, so the entry is kept rather than deleted.
+        let age = last_used(&path)
             .and_then(|t| now.duration_since(t).ok())
             .unwrap_or_default();
         if age > MAX_AGE {
@@ -173,6 +213,57 @@ mod tests {
         assert_ne!(a, c);
         assert_eq!(a.len(), 16);
         let _ = fs::remove_file(&tmp);
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("clip-editor-cache-{name}"));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The original bug: `touch` had an effect on first import and never again,
+    /// so a source opened every day was deleted on day 14 anyway. A second
+    /// touch must move the recorded time forward.
+    #[test]
+    fn touching_twice_moves_the_recorded_time() {
+        let dir = temp_dir("touch-twice");
+        let cache = SourceCache { dir: dir.clone() };
+
+        cache.touch();
+        // Backdate well past MAX_AGE, as if this entry had been sitting here
+        // since the first import, then open the source again.
+        fs::write(used_marker(&dir), "1000").unwrap();
+        let stale = last_used(&dir).unwrap();
+        assert!(
+            SystemTime::now().duration_since(stale).unwrap() > MAX_AGE,
+            "backdated marker should read as expired"
+        );
+
+        cache.touch();
+        let fresh = last_used(&dir).unwrap();
+        assert!(fresh > stale, "a second touch must move the time forward");
+        assert!(
+            SystemTime::now().duration_since(fresh).unwrap() < MAX_AGE,
+            "a just-touched entry must not read as expired"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Caches written before the marker existed must not be treated as brand
+    /// new (they would leak forever) or as ancient (a live proxy would go).
+    #[test]
+    fn entries_without_a_marker_fall_back_to_the_directory() {
+        let dir = temp_dir("no-marker");
+        let from_dir = last_used(&dir).expect("directory mtime is a usable fallback");
+        assert!(SystemTime::now().duration_since(from_dir).unwrap() < MAX_AGE);
+
+        // An unparseable marker is the same situation as no marker at all.
+        fs::write(used_marker(&dir), "not a timestamp").unwrap();
+        assert!(last_used(&dir).is_some());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
