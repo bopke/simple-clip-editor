@@ -5,7 +5,7 @@
 
 use crate::audio::{Pcm, Waveform};
 use crate::ffmpeg::Cancel;
-use clip_core::{FrameIdx, RationalTime};
+use clip_core::{FrameIdx, RationalTime, TrackId};
 use crossbeam_channel::{Receiver, Sender};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -39,7 +39,7 @@ pub enum Msg {
     ImportFailed(String),
 
     TrackReady {
-        index: usize,
+        id: TrackId,
         duration: Option<RationalTime>,
         pcm: Option<Arc<Pcm>>,
     },

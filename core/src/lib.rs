@@ -14,7 +14,7 @@ pub mod timeline;
 
 pub use model::{
     AspectMode, AudioSourceSelection, AudioStreamInfo, AudioTrack, CropRect, OriginalAudio,
-    OutputPreset, OutputSettings, Project, Quality, QualityBucket, Segment, SourceInfo,
+    OutputPreset, OutputSettings, Project, Quality, QualityBucket, Segment, SourceInfo, TrackId,
 };
 pub use time::{FrameIdx, Rational, RationalTime};
 pub use timeline::Timeline;

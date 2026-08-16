@@ -11,7 +11,8 @@ use crate::jobs::{self, Msg, Rx, Tx};
 use crate::playback::{MixState, Player, VideoStream};
 use crate::undo::UndoStack;
 use clip_core::command::{self, HwEncoder, PCM_SAMPLE_RATE};
-use clip_core::{FrameIdx, Project, Rational, Timeline};
+use clip_core::{FrameIdx, Project, Rational, Timeline, TrackId};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -45,7 +46,14 @@ pub struct App {
 
     pub waveform: Option<Arc<Waveform>>,
     pub pcm: Option<Arc<Pcm>>,
-    pub track_pcm: Vec<Option<Arc<Pcm>>>,
+    /// Decoded audio for added tracks, keyed by identity rather than position.
+    ///
+    /// This was a `Vec` index-aligned with `project.added_tracks`, which is the
+    /// condition that made a removal misroute an in-flight decode: two
+    /// sequences that must be kept in step, one of them mutated from the UI and
+    /// the other from a worker. A map has no positions to keep in step, and an
+    /// entry with no matching track is inert rather than wrong.
+    pub track_pcm: HashMap<TrackId, Arc<Pcm>>,
     pub thumbs: Vec<PathBuf>,
     pub thumb_textures: Vec<egui::TextureHandle>,
 
@@ -125,7 +133,7 @@ impl App {
             import_progress: 0.0,
             waveform: None,
             pcm: None,
-            track_pcm: Vec::new(),
+            track_pcm: HashMap::new(),
             thumbs: Vec::new(),
             thumb_textures: Vec::new(),
             frames,
@@ -509,6 +517,12 @@ impl App {
         else {
             return;
         };
+        self.add_audio_track_from_path(path);
+    }
+
+    /// The half of `add_audio_track` that does not need a file dialog, so the
+    /// add/remove/decode interleaving can be driven in a test.
+    pub fn add_audio_track_from_path(&mut self, path: PathBuf) {
         let (Some(tools), Some(project), Some(cache)) = (
             self.tools.clone(),
             self.project.as_mut(),
@@ -517,28 +531,74 @@ impl App {
             return;
         };
         self.undo.push(project.clone());
-        let index = project.added_tracks.len();
-        project
-            .added_tracks
-            .push(clip_core::AudioTrack::new(path.clone()));
-        self.track_pcm.push(None);
-        let dest = cache.dir.join(format!("track_{index}.f32"));
+        let track = clip_core::AudioTrack::new(path.clone());
+        let id = track.id;
+        project.added_tracks.push(track);
+        // Named by id, not position: `track_2.f32` used to be handed out again
+        // to a different track as soon as one was removed, so a decode still
+        // running would write over the file a newer track was reading.
+        let dest = scratch_path(&cache, id);
         let tx = self.tx.clone();
         std::thread::Builder::new()
             .name("track-load".into())
-            .spawn(move || import::load_track(tools, index, path, dest, tx))
+            .spawn(move || import::load_track(tools, id, path, dest, tx))
             .expect("spawning track loader");
     }
 
+    /// Remove by position — the UI acts on the list it is drawing, and that is
+    /// a legitimate use of an index because it is resolved immediately.
     pub fn remove_audio_track(&mut self, index: usize) {
         self.snapshot();
-        if let Some(p) = self.project.as_mut() {
-            if index < p.added_tracks.len() {
-                p.added_tracks.remove(index);
-            }
+        let Some(p) = self.project.as_mut() else {
+            return;
+        };
+        if index >= p.added_tracks.len() {
+            return;
         }
-        if index < self.track_pcm.len() {
-            self.track_pcm.remove(index);
+        let removed = p.added_tracks.remove(index);
+        // Dropping the decoded audio here means an undo restores the track
+        // without its samples, which is what the old code did too. Keeping it
+        // would mean holding on to every removed track's PCM for the session —
+        // ~115 MB for five minutes of stereo — for a case the user can fix by
+        // re-adding the file.
+        self.track_pcm.remove(&removed.id);
+        if let Some(cache) = &self.cache {
+            let _ = std::fs::remove_file(scratch_path(cache, removed.id));
+        }
+        self.refresh_mix();
+    }
+
+    /// A decode finished. The track it was for may have moved, or be gone.
+    fn track_ready(
+        &mut self,
+        id: TrackId,
+        duration: Option<clip_core::RationalTime>,
+        pcm: Option<Arc<Pcm>>,
+    ) {
+        let track = self
+            .project
+            .as_mut()
+            .and_then(|p| p.added_tracks.iter_mut().find(|t| t.id == id));
+        let Some(track) = track else {
+            // Removed while it was decoding. Nothing to attach the result to,
+            // so drop it — and take the scratch file with it, since the decode
+            // has finished writing by the time this arrives and nothing else
+            // will ever come looking for that name.
+            if let Some(cache) = &self.cache {
+                let _ = std::fs::remove_file(scratch_path(cache, id));
+            }
+            return;
+        };
+        track.duration = duration;
+        match pcm {
+            Some(pcm) => {
+                self.track_pcm.insert(id, pcm);
+            }
+            // A failed decode leaves the track in place but silent, rather than
+            // leaving a previous track's samples under this id.
+            None => {
+                self.track_pcm.remove(&id);
+            }
         }
         self.refresh_mix();
     }
@@ -592,21 +652,7 @@ impl App {
                     self.errors.push(e);
                     self.import_job = None;
                 }
-                Msg::TrackReady {
-                    index,
-                    duration,
-                    pcm,
-                } => {
-                    if let Some(p) = self.project.as_mut() {
-                        if let Some(t) = p.added_tracks.get_mut(index) {
-                            t.duration = duration;
-                        }
-                    }
-                    if index < self.track_pcm.len() {
-                        self.track_pcm[index] = pcm;
-                    }
-                    self.refresh_mix();
-                }
+                Msg::TrackReady { id, duration, pcm } => self.track_ready(id, duration, pcm),
                 Msg::Frame(frame) => {
                     if frame.generation >= self.generation {
                         self.upload_frame(ctx, &frame);
@@ -709,6 +755,12 @@ impl App {
             .map(|f| (f.to_time(self.fps()).as_f64() * PCM_SAMPLE_RATE as f64) as u64)
             .unwrap_or(0)
     }
+}
+
+/// Where a track's decoded PCM is written. Named by id so the same name is
+/// never handed out to two different tracks — see [`TrackId`].
+fn scratch_path(cache: &SourceCache, id: TrackId) -> PathBuf {
+    cache.dir.join(format!("track_{}.f32", id.0))
 }
 
 fn configure_style(ctx: &egui::Context) {

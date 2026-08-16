@@ -7,7 +7,7 @@ use crate::ffmpeg::{Cancel, Tools};
 use crate::jobs::{DecodedFrame, Msg, Tx};
 use clip_core::command;
 use clip_core::progress::fraction;
-use clip_core::{FrameIdx, Project, RationalTime, SourceInfo};
+use clip_core::{FrameIdx, Project, RationalTime, SourceInfo, TrackId};
 use crossbeam_channel::{Receiver, Sender};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -121,7 +121,10 @@ pub fn run_import(tools: Tools, project: Project, cache: SourceCache, tx: Tx, ca
 }
 
 /// Probe an added music track and decode it for the preview mixer.
-pub fn load_track(tools: Tools, index: usize, path: PathBuf, dest: PathBuf, tx: Tx) {
+///
+/// Carries the track's id, not its position: by the time this finishes the
+/// track may have moved or been removed entirely.
+pub fn load_track(tools: Tools, id: TrackId, path: PathBuf, dest: PathBuf, tx: Tx) {
     let duration = probe_duration(&tools, &path);
     let cancel = Cancel::new();
     let pcm = if tools
@@ -132,11 +135,7 @@ pub fn load_track(tools: Tools, index: usize, path: PathBuf, dest: PathBuf, tx: 
     } else {
         None
     };
-    let _ = tx.send(Msg::TrackReady {
-        index,
-        duration,
-        pcm,
-    });
+    let _ = tx.send(Msg::TrackReady { id, duration, pcm });
 }
 
 // ---------------------------------------------------------------------------

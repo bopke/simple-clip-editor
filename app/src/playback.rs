@@ -8,9 +8,10 @@ use crate::audio::Pcm;
 use crate::ffmpeg::{Cancel, Tools};
 use clip_core::audio_math;
 use clip_core::command::{self, PCM_SAMPLE_RATE};
-use clip_core::{FrameIdx, Project, Rational, RationalTime, Timeline};
+use clip_core::{FrameIdx, Project, Rational, RationalTime, Timeline, TrackId};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use crossbeam_channel::{bounded, Receiver};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -43,7 +44,7 @@ impl MixState {
     pub fn build(
         project: &Project,
         original: Option<Arc<Pcm>>,
-        track_pcm: &[Option<Arc<Pcm>>],
+        track_pcm: &HashMap<TrackId, Arc<Pcm>>,
     ) -> MixState {
         let timeline = Timeline::new(project.normalised_segments());
         let fps = project.project_fps;
@@ -52,9 +53,11 @@ impl MixState {
         let tracks = project
             .added_tracks
             .iter()
-            .enumerate()
-            .filter_map(|(i, t)| {
-                let pcm = track_pcm.get(i).cloned().flatten()?;
+            .filter_map(|t| {
+                // By id: a track whose decode has not finished (or failed) is
+                // simply absent from the mix, and no track can pick up another
+                // one's samples by standing where it used to.
+                let pcm = track_pcm.get(&t.id).cloned()?;
                 let start = if t.offset.is_negative() {
                     0
                 } else {
@@ -451,7 +454,7 @@ mod tests {
         let pcm = Arc::new(Pcm {
             samples: (0..n * 2).map(|i| 0.05 * (i / 2 / 48_000) as f32).collect(),
         });
-        let state = MixState::build(&project, Some(pcm), &[]);
+        let state = MixState::build(&project, Some(pcm), &HashMap::new());
         // Start of the clip is source second 0.
         assert_eq!(state.sample(0).0, 0.0);
         // The first segment is frames 0..60 at 60 fps — one second — after
@@ -470,7 +473,7 @@ mod tests {
     fn muted_original_is_silent_but_tracks_still_play() {
         let mut project = project_with_cut();
         project.original_audio.gain_db = f32::NEG_INFINITY;
-        let mut state = MixState::build(&project, Some(tone(48_000, 0.5)), &[]);
+        let mut state = MixState::build(&project, Some(tone(48_000, 0.5)), &HashMap::new());
         assert_eq!(state.sample(10), (0.0, 0.0));
         state.tracks.push(MixTrack {
             pcm: tone(48_000, 0.25),
@@ -486,7 +489,7 @@ mod tests {
     fn mix_is_limited_not_clipped_raw() {
         let mut project = project_with_cut();
         project.original_audio.gain_db = 0.0;
-        let mut state = MixState::build(&project, Some(tone(48_000, 0.9)), &[]);
+        let mut state = MixState::build(&project, Some(tone(48_000, 0.9)), &HashMap::new());
         state.tracks.push(MixTrack {
             pcm: tone(48_000, 0.9),
             start_sample: 0,
@@ -502,7 +505,7 @@ mod tests {
     #[test]
     fn track_offset_delays_playback() {
         let project = project_with_cut();
-        let mut state = MixState::build(&project, None, &[]);
+        let mut state = MixState::build(&project, None, &HashMap::new());
         state.original_muted = true;
         state.tracks.push(MixTrack {
             pcm: tone(48_000, 0.3),

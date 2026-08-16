@@ -3,6 +3,7 @@
 use crate::time::{FrameIdx, Rational, RationalTime};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Project {
@@ -288,8 +289,42 @@ pub enum AudioSourceSelection {
     MixAll,
 }
 
+/// Stable identity for an added track.
+///
+/// A track's *position* is not identity: removing one shifts every later track
+/// down, so anything that outlives the moment it was created — a background
+/// decode, the name of a scratch file — has to refer to a track by something
+/// that does not move, and that is not reused when a removed track's slot is
+/// filled again.
+///
+/// Cloning a `Project` (undo snapshots) deliberately preserves ids: those are
+/// the same logical tracks, so a decode in flight across an undo still lands
+/// where it belongs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct TrackId(pub u64);
+
+impl TrackId {
+    /// Ids come from a process-wide counter rather than a per-project one, so
+    /// they stay unique across undo, across a project being replaced, and
+    /// across two projects existing at once.
+    ///
+    /// Deserialised projects are the one gap: a future project loader has to
+    /// reassign ids, since ids from a file were minted by a different process
+    /// and can collide with this counter.
+    fn next() -> TrackId {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        TrackId(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AudioTrack {
+    /// Identity, not position. See [`TrackId`].
+    ///
+    /// `serde(default)` so a project file written before this existed still
+    /// loads; such a file needs its ids reassigned, per [`TrackId::next`].
+    #[serde(default = "TrackId::next")]
+    pub id: TrackId,
     pub path: PathBuf,
     /// Position on the OUTPUT timeline. May be negative, meaning the track
     /// starts before the clip does.
@@ -306,6 +341,7 @@ pub struct AudioTrack {
 impl AudioTrack {
     pub fn new(path: PathBuf) -> AudioTrack {
         AudioTrack {
+            id: TrackId::next(),
             path,
             offset: RationalTime::ZERO,
             trim_in: None,
