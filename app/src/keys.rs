@@ -18,6 +18,8 @@ pub const HELP: &[(&str, &str)] = &[
     ("Home / End", "Start / end of timeline"),
     ("C", "Toggle crop tool"),
     ("Ctrl+Z / Ctrl+Shift+Z", "Undo / redo"),
+    ("Ctrl+S / Ctrl+Shift+S", "Save project / save as"),
+    ("Ctrl+O", "Open a project or a video"),
     ("Ctrl+E", "Export"),
     ("Esc", "Cancel drag / close dialog"),
 ];
@@ -58,6 +60,8 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
                 }
             }
             Key::O if mods.command => app.open_dialog(),
+            Key::S if mods.command && mods.shift => app.save_project_as(),
+            Key::S if mods.command => app.save_project(),
             Key::E if mods.command => app.show_export = true,
             Key::Z if mods.command && mods.shift => app.redo(),
             Key::Z if mods.command => app.undo(),

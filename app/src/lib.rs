@@ -13,6 +13,8 @@ pub mod import;
 pub mod jobs;
 pub mod keys;
 pub mod playback;
+pub mod project_file;
+pub mod recovery;
 pub mod ui_export;
 pub mod ui_firstrun;
 pub mod ui_preview;

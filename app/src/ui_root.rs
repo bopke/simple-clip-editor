@@ -43,6 +43,8 @@ pub fn root_ui(app: &mut App, ui: &mut egui::Ui) {
 
     keys::handle(app, &ctx);
     keys::tick_shuttle(app, &ctx);
+    app.autosave_tick();
+    app.sync_window_title(&ctx);
     app.follow_playback(&ctx);
     accept_dropped_file(app, &ctx);
 
@@ -69,6 +71,9 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self) {
+        // Settle the recovery snapshot before tearing anything down: unsaved
+        // work is written out, saved work clears it.
+        self.finish_session();
         // Kill anything still running and take the intermediates with it.
         self.cancel_import();
         self.cancel_export();
@@ -197,6 +202,13 @@ fn toolbar(app: &mut App, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         if ui.button("Open…").clicked() {
             app.open_dialog();
+        }
+        if ui
+            .add_enabled(app.project.is_some(), egui::Button::new("Save"))
+            .on_hover_text("Save the project (Ctrl+S)")
+            .clicked()
+        {
+            app.save_project();
         }
         ui.separator();
 

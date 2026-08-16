@@ -21,6 +21,14 @@ pub fn probe_source(tools: &Tools, path: &Path) -> Result<SourceInfo, String> {
     clip_core::probe::parse(&json, path).map_err(|e| e.to_string())
 }
 
+/// A file is only worth reading if it exists and is non-empty — a killed or
+/// crashed ffmpeg leaves a zero-byte scratch file behind.
+fn is_usable(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false)
+}
+
 /// Duration only, for sources we do not otherwise inspect — an added music
 /// track needs its length but nothing else ffprobe reports.
 fn probe_duration(tools: &Tools, path: &Path) -> Option<RationalTime> {
@@ -124,7 +132,22 @@ pub fn run_import(tools: Tools, project: Project, cache: SourceCache, tx: Tx, ca
 ///
 /// Carries the track's id, not its position: by the time this finishes the
 /// track may have moved or been removed entirely.
+///
+/// A scratch file already at `dest` is read instead of decoding again. That is
+/// what makes undoing a track removal cheap: the samples were dropped from
+/// memory, not from disk. It reports no duration, because nothing was probed —
+/// the caller keeps the duration it already has.
 pub fn load_track(tools: Tools, id: TrackId, path: PathBuf, dest: PathBuf, tx: Tx) {
+    if is_usable(&dest) {
+        if let Ok(pcm) = Pcm::load(&dest) {
+            let _ = tx.send(Msg::TrackReady {
+                id,
+                duration: None,
+                pcm: Some(pcm),
+            });
+            return;
+        }
+    }
     let duration = probe_duration(&tools, &path);
     let cancel = Cancel::new();
     let pcm = if tools

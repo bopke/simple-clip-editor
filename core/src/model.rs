@@ -109,6 +109,18 @@ impl Project {
     pub fn has_audio(&self) -> bool {
         !self.source.audio_streams.is_empty()
     }
+
+    /// Mint fresh [`TrackId`]s for every added track.
+    ///
+    /// Ids come from a process-wide counter, so ids read from a file were
+    /// minted by a different process and can collide with tracks this one
+    /// already has — including scratch files named after them. A loader calls
+    /// this before the project is used for anything.
+    pub fn reassign_track_ids(&mut self) {
+        for track in &mut self.added_tracks {
+            track.id = TrackId::next();
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

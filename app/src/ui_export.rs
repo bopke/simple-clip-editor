@@ -4,9 +4,50 @@ use crate::app::App;
 use egui::{Color32, RichText};
 
 pub fn overlays(app: &mut App, ctx: &egui::Context) {
+    recovery_notice(app, ctx);
     export_dialog(app, ctx);
     hdr_notice(app, ctx);
     errors(app, ctx);
+}
+
+/// Unsaved work from a session that ended badly. Shown before anything else,
+/// because opening a file would otherwise throw away the very thing being
+/// offered.
+fn recovery_notice(app: &mut App, ctx: &egui::Context) {
+    let Some(pending) = &app.pending_recovery else {
+        return;
+    };
+    let label = pending.label();
+    let mut restore = false;
+    let mut discard = false;
+    egui::Window::new("Unsaved work")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .show(ctx, |ui| {
+            ui.set_max_width(420.0);
+            ui.label(format!(
+                "Clip last closed with unsaved changes to {label} — either \
+                 without saving, or without closing at all."
+            ));
+            ui.label(
+                RichText::new(
+                    "Restoring opens it as an unsaved edit — save it somewhere to keep it.",
+                )
+                .size(11.0)
+                .color(Color32::from_gray(150)),
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                restore = ui.button("Restore").clicked();
+                discard = ui.button("Discard").clicked();
+            });
+        });
+    if restore {
+        app.restore_recovery();
+    } else if discard {
+        app.discard_recovery();
+    }
 }
 
 fn export_dialog(app: &mut App, ctx: &egui::Context) {

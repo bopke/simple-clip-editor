@@ -9,12 +9,15 @@ use crate::ffmpeg::{Cancel, Tools};
 use crate::import::{self, FrameRequest, FrameServer};
 use crate::jobs::{self, Msg, Rx, Tx};
 use crate::playback::{MixState, Player, VideoStream};
+use crate::project_file;
+use crate::recovery;
 use crate::undo::UndoStack;
 use clip_core::command::{self, HwEncoder, PCM_SAMPLE_RATE};
 use clip_core::{FrameIdx, Project, Rational, Timeline, TrackId};
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// How far playback may run past a video stream's start before the stream is
 /// restarted rather than fast-forwarded through.
@@ -64,6 +67,10 @@ pub struct App {
     /// the other from a worker. A map has no positions to keep in step, and an
     /// entry with no matching track is inert rather than wrong.
     pub track_pcm: HashMap<TrackId, Arc<Pcm>>,
+    /// Tracks with a decode in flight. A track with no PCM is not necessarily
+    /// one that needs loading — it may be one that is loading right now, and
+    /// starting a second decode would put two writers on one scratch file.
+    pub loading_tracks: HashSet<TrackId>,
     pub thumbs: Vec<PathBuf>,
     pub thumb_textures: Vec<egui::TextureHandle>,
 
@@ -95,6 +102,20 @@ pub struct App {
     pub status: String,
     pub errors: Vec<String>,
     pub hdr_warning: bool,
+
+    /// Where `Ctrl+S` writes without asking. `None` until the edit has been
+    /// saved once, or opened from a file.
+    pub save_path: Option<PathBuf>,
+    /// Edits since the last save. Drives the title bar and, with it, whether
+    /// there is anything worth recovering after a crash.
+    pub unsaved: bool,
+    /// An autosave from a previous run that ended without a clean exit,
+    /// waiting for the user to take it or leave it.
+    pub pending_recovery: Option<recovery::Pending>,
+    /// When the recovery snapshot was last written.
+    last_autosave: Instant,
+    /// The title currently on the window, so it is only pushed when it moves.
+    shown_title: String,
 }
 
 pub struct CropDrag {
@@ -144,6 +165,7 @@ impl App {
             waveform: None,
             pcm: None,
             track_pcm: HashMap::new(),
+            loading_tracks: HashSet::new(),
             thumbs: Vec::new(),
             thumb_textures: Vec::new(),
             frames,
@@ -169,6 +191,11 @@ impl App {
             status: String::new(),
             errors: Vec::new(),
             hdr_warning: false,
+            save_path: None,
+            unsaved: false,
+            pending_recovery: recovery::pending(),
+            last_autosave: Instant::now(),
+            shown_title: String::new(),
         }
     }
 
@@ -199,12 +226,26 @@ impl App {
 
     // -- opening -------------------------------------------------------
 
+    /// One Open for both kinds of file. Which one it is follows from the
+    /// extension, so the user picks "the thing they want to work on" rather
+    /// than first having to tell the app which menu item they meant.
     pub fn open_dialog(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter(
-                "Video",
-                &["mkv", "mp4", "mov", "webm", "avi", "flv", "m4v", "ts"],
+                "Clip project or video",
+                &[
+                    project_file::EXTENSION,
+                    "mkv",
+                    "mp4",
+                    "mov",
+                    "webm",
+                    "avi",
+                    "flv",
+                    "m4v",
+                    "ts",
+                ],
             )
+            .add_filter("Clip project", &[project_file::EXTENSION])
             .pick_file()
         else {
             return;
@@ -213,12 +254,19 @@ impl App {
     }
 
     pub fn open_path(&mut self, path: PathBuf) {
+        if project_file::is_project_file(&path) {
+            self.open_project_path(path);
+        } else {
+            self.import_source(path);
+        }
+    }
+
+    /// Open a video: a brand new edit over it.
+    fn import_source(&mut self, path: PathBuf) {
         let Some(tools) = self.tools.clone() else {
             self.errors.push("ffmpeg is not set up yet".into());
             return;
         };
-        self.cancel_import();
-        self.stop_playback();
         match import::probe_source(&tools, &path) {
             Ok(source) => {
                 if source.is_hdr {
@@ -227,25 +275,241 @@ impl App {
                     self.hdr_warning = true;
                 }
                 let project = Project::new(source);
-                self.playhead = FrameIdx(0);
-                self.selection = None;
-                self.waveform = None;
-                self.pcm = None;
-                self.track_pcm.clear();
-                self.thumbs.clear();
-                self.thumb_textures.clear();
-                self.texture = None;
-                self.shown_frame = None;
-                self.proxy = None;
-                self.export_result = None;
-                self.undo = UndoStack::default();
-                self.output_path = Some(export::suggested_output(&project));
-                self.project = Some(project);
-                self.start_import();
-                self.request_frame(FrameIdx(0));
+                self.reset_for(project, project_file::ViewState::default());
+                self.save_path = None;
+                self.unsaved = false;
             }
             Err(e) => self.errors.push(e),
         }
+    }
+
+    /// Open a `.clip` file: the edit is restored, and the media it refers to
+    /// is imported again behind it.
+    pub fn open_project_path(&mut self, path: PathBuf) {
+        let file = match project_file::load(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                self.errors.push(format!("{e:#}"));
+                return;
+            }
+        };
+        if !file.project.source.path.exists() {
+            // Worth opening anyway: the edit is intact, and the user may be
+            // able to point at the file or reconnect the drive it is on.
+            self.errors.push(format!(
+                "source file is missing: {}",
+                file.project.source.path.display()
+            ));
+        }
+        self.hdr_warning = file.project.source.is_hdr;
+        self.reset_for(file.project, file.view);
+        self.save_path = Some(path);
+        self.unsaved = false;
+        // The edit refers to audio by path, so every added track decodes again
+        // — from its scratch file if this machine still has one, otherwise
+        // from the file itself.
+        self.reload_missing_track_audio();
+    }
+
+    /// Replace the open project and drop everything derived from the old one.
+    fn reset_for(&mut self, project: Project, view: project_file::ViewState) {
+        self.cancel_import();
+        self.stop_playback();
+        self.playhead = view.playhead;
+        self.selection = view.selection;
+        self.waveform = None;
+        self.pcm = None;
+        self.track_pcm.clear();
+        self.thumbs.clear();
+        self.thumb_textures.clear();
+        self.texture = None;
+        self.shown_frame = None;
+        self.proxy = None;
+        self.export_result = None;
+        self.undo = UndoStack::default();
+        self.output_path = Some(export::suggested_output(&project));
+        self.project = Some(project);
+        self.start_import();
+        let playhead = self.playhead;
+        self.request_frame(playhead);
+    }
+
+    // -- saving --------------------------------------------------------
+
+    fn view_state(&self) -> project_file::ViewState {
+        project_file::ViewState {
+            playhead: self.playhead,
+            selection: self.selection,
+        }
+    }
+
+    /// `Ctrl+S`. Writes straight to the known path; asks for one the first time.
+    pub fn save_project(&mut self) {
+        match self.save_path.clone() {
+            Some(path) => self.save_project_to(path),
+            None => self.save_project_as(),
+        }
+    }
+
+    /// `Ctrl+Shift+S`. Always asks, and the answer becomes the new save path.
+    pub fn save_project_as(&mut self) {
+        if self.project.is_none() {
+            return;
+        }
+        let suggested = self.suggested_project_name();
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Clip project", &[project_file::EXTENSION])
+            .set_file_name(suggested)
+            .save_file()
+        else {
+            return;
+        };
+        self.save_project_to(project_file::with_extension(path));
+    }
+
+    pub fn save_project_to(&mut self, path: PathBuf) {
+        let Some(project) = self.project.as_ref() else {
+            return;
+        };
+        match project_file::save(&path, project, &self.view_state()) {
+            Ok(()) => {
+                self.status = format!("Saved {}", file_label(&path));
+                self.save_path = Some(path);
+                self.unsaved = false;
+                // The saved file is now the copy worth having.
+                self.discard_recovery();
+            }
+            Err(e) => self.errors.push(format!("{e:#}")),
+        }
+    }
+
+    /// The source file's name with a `.clip` extension — the edit is "of" that
+    /// video, and that is the name the user is thinking in.
+    fn suggested_project_name(&self) -> String {
+        self.project
+            .as_ref()
+            .and_then(|p| {
+                p.source
+                    .path
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+            })
+            .map(|stem| format!("{stem}.{}", project_file::EXTENSION))
+            .unwrap_or_else(|| format!("untitled.{}", project_file::EXTENSION))
+    }
+
+    /// Push the title to the window when it changes — which edit is open and
+    /// whether it has unsaved changes both belong there.
+    pub fn sync_window_title(&mut self, ctx: &egui::Context) {
+        let title = self.window_title();
+        if title != self.shown_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.shown_title = title;
+        }
+    }
+
+    /// Title bar: which edit this is, and whether it has been saved.
+    pub fn window_title(&self) -> String {
+        let base = crate::version::window_title();
+        let Some(project) = &self.project else {
+            return base;
+        };
+        let name = match &self.save_path {
+            Some(p) => file_label(p),
+            None => file_label(&project.source.path),
+        };
+        let mark = if self.unsaved { "• " } else { "" };
+        format!("{mark}{name} — {base}")
+    }
+
+    // -- crash recovery ------------------------------------------------
+
+    /// Write the recovery snapshot if enough time has passed. Called every
+    /// frame; does nothing unless there is unsaved work to lose.
+    pub fn autosave_tick(&mut self) {
+        if !self.unsaved || self.project.is_none() {
+            return;
+        }
+        if self.last_autosave.elapsed() < recovery::INTERVAL {
+            return;
+        }
+        self.last_autosave = Instant::now();
+        let Some(project) = self.project.as_ref() else {
+            return;
+        };
+        // A failed autosave is not worth an error box: the user did not ask
+        // for it, and the edit in front of them is unaffected.
+        let _ = recovery::write(project, &self.view_state());
+    }
+
+    /// Take the unsaved work from the previous session.
+    pub fn restore_recovery(&mut self) {
+        let Some(pending) = self.pending_recovery.take() else {
+            return;
+        };
+        self.hdr_warning = pending.file.project.source.is_hdr;
+        self.reset_for(pending.file.project, pending.file.view);
+        // Deliberately no save path: this was never saved anywhere, and
+        // inheriting one would let Ctrl+S overwrite a file the user last saw
+        // in a different state. It stays unsaved, and the snapshot stays on
+        // disk until it is either saved or discarded.
+        self.save_path = None;
+        self.unsaved = true;
+        self.reload_missing_track_audio();
+    }
+
+    /// Throw the previous session's unsaved work away.
+    pub fn discard_recovery(&mut self) {
+        self.pending_recovery = None;
+        recovery::discard();
+    }
+
+    /// Shutting down. Unsaved work is written out one last time rather than
+    /// discarded: closing the window without saving loses an edit just as
+    /// thoroughly as crashing does, and the next launch can offer either one
+    /// back. Everything saved leaves nothing behind.
+    pub fn finish_session(&mut self) {
+        match (self.unsaved, self.project.as_ref()) {
+            (true, Some(project)) => {
+                let _ = recovery::write(project, &self.view_state());
+            }
+            _ => recovery::discard(),
+        }
+    }
+
+    // -- added track audio ---------------------------------------------
+
+    /// Decode any added track that has no PCM in memory.
+    ///
+    /// Used after opening a project and after an undo restores a removed
+    /// track. [`import::load_track`] reads the scratch file when one is there,
+    /// so this is usually a file read rather than another trip through ffmpeg.
+    pub fn reload_missing_track_audio(&mut self) {
+        let Some(project) = self.project.as_ref() else {
+            return;
+        };
+        let missing: Vec<(TrackId, PathBuf)> = project
+            .added_tracks
+            .iter()
+            .filter(|t| !self.track_pcm.contains_key(&t.id) && !self.loading_tracks.contains(&t.id))
+            .map(|t| (t.id, t.path.clone()))
+            .collect();
+        for (id, path) in missing {
+            self.spawn_track_load(id, path);
+        }
+    }
+
+    fn spawn_track_load(&mut self, id: TrackId, path: PathBuf) {
+        let (Some(tools), Some(cache)) = (self.tools.clone(), self.cache.clone()) else {
+            return;
+        };
+        self.loading_tracks.insert(id);
+        let dest = scratch_path(&cache, id);
+        let tx = self.tx.clone();
+        std::thread::Builder::new()
+            .name("track-load".into())
+            .spawn(move || import::load_track(tools, id, path, dest, tx))
+            .expect("spawning track loader");
     }
 
     fn start_import(&mut self) {
@@ -320,6 +584,9 @@ impl App {
             if let Some(prev) = self.undo.undo(p.clone()) {
                 *p = prev;
                 self.after_edit();
+                // An undone removal brings a track back; its samples were
+                // dropped from memory but its scratch file was not.
+                self.reload_missing_track_audio();
             }
         }
     }
@@ -329,6 +596,7 @@ impl App {
             if let Some(next) = self.undo.redo(p.clone()) {
                 *p = next;
                 self.after_edit();
+                self.reload_missing_track_audio();
             }
         }
     }
@@ -336,6 +604,7 @@ impl App {
     /// Called after anything that changes the edit: keeps the playhead on a
     /// kept frame and rebuilds the mix the audio callback reads.
     pub fn after_edit(&mut self) {
+        self.unsaved = true;
         let timeline = self.timeline();
         if !timeline.is_empty() && timeline.to_output(self.playhead).is_none() {
             if let Some(out) = timeline.to_output_snapped(self.playhead) {
@@ -538,9 +807,9 @@ impl App {
     /// The half of `add_audio_track` that does not need a file dialog, so the
     /// add/remove/decode interleaving can be driven in a test.
     pub fn add_audio_track_from_path(&mut self, path: PathBuf) {
-        let (Some(tools), Some(cache)) = (self.tools.clone(), self.cache.clone()) else {
+        if self.tools.is_none() || self.cache.is_none() {
             return;
-        };
+        }
         if self.project.is_none() {
             return;
         }
@@ -551,15 +820,7 @@ impl App {
         let track = clip_core::AudioTrack::new(path.clone());
         let id = track.id;
         project.added_tracks.push(track);
-        // Named by id, not position: `track_2.f32` used to be handed out again
-        // to a different track as soon as one was removed, so a decode still
-        // running would write over the file a newer track was reading.
-        let dest = scratch_path(&cache, id);
-        let tx = self.tx.clone();
-        std::thread::Builder::new()
-            .name("track-load".into())
-            .spawn(move || import::load_track(tools, id, path, dest, tx))
-            .expect("spawning track loader");
+        self.spawn_track_load(id, path);
     }
 
     /// Remove by position — the UI acts on the list it is drawing, and that is
@@ -579,15 +840,13 @@ impl App {
             return;
         };
         let removed = p.added_tracks.remove(index);
-        // Dropping the decoded audio here means an undo restores the track
-        // without its samples, which is what the old code did too. Keeping it
-        // would mean holding on to every removed track's PCM for the session —
-        // ~115 MB for five minutes of stereo — for a case the user can fix by
-        // re-adding the file.
+        // The decoded samples go, because holding every removed track's PCM
+        // for the session costs ~115 MB per five minutes of stereo. The
+        // scratch file on disk stays, so an undo reads the audio back instead
+        // of restoring a silent track — see `reload_missing_track_audio`. It
+        // is a cache artifact and is cleaned up with the rest of the source's
+        // cache entry rather than being tied to the undo stack.
         self.track_pcm.remove(&removed.id);
-        if let Some(cache) = &self.cache {
-            let _ = std::fs::remove_file(scratch_path(cache, removed.id));
-        }
         self.refresh_mix();
     }
 
@@ -598,21 +857,23 @@ impl App {
         duration: Option<clip_core::RationalTime>,
         pcm: Option<Arc<Pcm>>,
     ) {
+        self.loading_tracks.remove(&id);
         let track = self
             .project
             .as_mut()
             .and_then(|p| p.added_tracks.iter_mut().find(|t| t.id == id));
         let Some(track) = track else {
-            // Removed while it was decoding. Nothing to attach the result to,
-            // so drop it — and take the scratch file with it, since the decode
-            // has finished writing by the time this arrives and nothing else
-            // will ever come looking for that name.
-            if let Some(cache) = &self.cache {
-                let _ = std::fs::remove_file(scratch_path(cache, id));
-            }
+            // Removed while it was decoding, or removed and then undone back
+            // out again. Nothing to attach the result to, so drop it — but the
+            // scratch file stays, since an undo can still ask for this id.
             return;
         };
-        track.duration = duration;
+        // Only overwrite a known duration: a reload from the scratch file has
+        // no probe behind it and reports `None`, which is not the same as
+        // "this track has no duration".
+        if duration.is_some() {
+            track.duration = duration;
+        }
         match pcm {
             Some(pcm) => {
                 self.track_pcm.insert(id, pcm);
@@ -784,6 +1045,13 @@ impl App {
     }
 }
 
+/// A path as the user thinks of it: the file name, not the whole path.
+fn file_label(path: &Path) -> String {
+    path.file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
 /// The same instant, as a frame index on a different grid.
 ///
 /// Cursors (playhead, selection) are frame indices because they address the
@@ -797,7 +1065,10 @@ fn regrid(f: FrameIdx, from: Rational, to: Rational) -> FrameIdx {
 
 /// Where a track's decoded PCM is written. Named by id so the same name is
 /// never handed out to two different tracks — see [`TrackId`].
-fn scratch_path(cache: &SourceCache, id: TrackId) -> PathBuf {
+///
+/// Public because the file outliving a removal is now load-bearing: undo reads
+/// it back, and a test has to be able to look at it.
+pub fn scratch_path(cache: &SourceCache, id: TrackId) -> PathBuf {
     cache.dir.join(format!("track_{}.f32", id.0))
 }
 

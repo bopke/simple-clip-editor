@@ -36,7 +36,7 @@ fn source_section(app: &mut App, ui: &mut egui::Ui) {
     heading(ui, "SOURCE");
     let Some(project) = &app.project else {
         ui.label(RichText::new("No file open").color(Color32::from_gray(120)));
-        if ui.button("Open video…").clicked() {
+        if ui.button("Open video or project…").clicked() {
             app.open_dialog();
         }
         return;
