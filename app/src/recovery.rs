@@ -123,6 +123,10 @@ mod tests {
         let mut p = Project::new(SourceInfo {
             path: "/media/capture.mkv".into(),
             duration: RationalTime::new(60, 1),
+            // Real dimensions: a crop cannot survive a round trip through a
+            // source with none, because loading repairs it away.
+            width: 1920,
+            height: 1080,
             avg_frame_rate: fps,
             r_frame_rate: fps,
             ..Default::default()
@@ -177,6 +181,41 @@ mod tests {
         app.unsaved = false;
         app.finish_session();
         assert!(pending().is_none());
+    }
+
+    /// The bug this whole mechanism was silently missing, from the outside.
+    ///
+    /// An hour of crop and audio work never set `unsaved`, so `finish_session`
+    /// took the `_ => discard()` arm: closing the window deleted the snapshot
+    /// and exited without a word, because the app believed there was nothing
+    /// to lose. Driving the real edit methods is the point — asserting on
+    /// `unsaved` alone would pass even if it were set somewhere that does not
+    /// reach the exit path.
+    #[test]
+    fn work_done_with_the_sliders_survives_the_exit_too() {
+        let _slot = Slot::take();
+        let ctx = egui::Context::default();
+        let mut app = crate::app::App::with_context(&ctx);
+        app.project = Some(project());
+        // As if it had just been saved: the state in which the old code threw
+        // the next hour of work away.
+        app.unsaved = false;
+
+        app.set_original_gain(-6.0);
+        app.set_aspect_and_crop(
+            clip_core::AspectMode::Locked(Rational::new(9, 16)),
+            Some(clip_core::CropRect {
+                x: 0,
+                y: 0,
+                w: 100,
+                h: 100,
+            }),
+        );
+
+        app.finish_session();
+        let found = pending().expect("crop and gain work is worth keeping");
+        assert_eq!(found.file.project.original_audio.gain_db, -6.0);
+        assert!(found.file.project.crop.is_some());
     }
 
     /// Saving is what makes the next launch quiet.

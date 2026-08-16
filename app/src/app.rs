@@ -30,6 +30,30 @@ use std::time::Instant;
 /// that is measured in wall-clock seconds at any rate.
 const STREAM_RESTART_AFTER_SECS: i64 = 20;
 
+/// How long after an edit from a control a further edit from that same control
+/// still counts as the same gesture.
+///
+/// Long enough to cover the gap between frames of a slow drag, short enough
+/// that coming back to a control after looking at the result is a separate
+/// thing to undo. A pause longer than this mid-drag splits the drag into two
+/// undo entries, which is the least wrong of the available failures.
+const COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// A control whose edits arrive one per frame while it is being dragged.
+///
+/// Identity, not position on screen: two edits coalesce only if they came from
+/// the same control, so moving from one slider to the next always starts a new
+/// undo entry even mid-gesture. Discrete controls — buttons, checkboxes, combo
+/// boxes — do not appear here, because each click of one is its own edit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Control {
+    CropRect,
+    OriginalGain,
+    TrackGain(usize),
+    TrackOffset(usize),
+    Crf,
+}
+
 /// What the first-run screen is doing.
 pub enum Boot {
     /// ffmpeg is available; the app is usable.
@@ -116,6 +140,10 @@ pub struct App {
     /// Unsaved work from the previous run — closed without saving, or not
     /// closed at all — waiting for the user to take it or leave it.
     pub pending_recovery: Option<recovery::Pending>,
+    /// Which control the last edit came from, and when — together they decide
+    /// whether the next edit continues a gesture or starts a new undo entry.
+    last_control: Option<Control>,
+    last_edit_at: Instant,
     /// When the recovery snapshot was last written.
     last_autosave: Instant,
     /// The title currently on the window, so it is only pushed when it moves.
@@ -200,6 +228,8 @@ impl App {
             save_path: None,
             unsaved: false,
             pending_recovery: recovery::pending(),
+            last_control: None,
+            last_edit_at: Instant::now(),
             last_autosave: Instant::now(),
             shown_title: String::new(),
         }
@@ -551,20 +581,18 @@ impl App {
     /// Changing the project fps invalidates the proxy, so the import runs
     /// again against a different cache key.
     pub fn set_project_fps(&mut self, fps: Rational) {
-        let Some(project) = self.project.as_mut() else {
+        let Some(project) = self.project.as_ref() else {
             return;
         };
-        if project.project_fps == fps {
+        let old = project.project_fps;
+        if old == fps {
             return;
         }
-        self.snapshot();
-        let project = self.project.as_mut().expect("checked just above");
-        let old = project.project_fps;
         // Segments are times, so the edit itself needs no conversion: the same
         // instants simply land on a different grid. Only the cursors are
         // expressed in frames, and those convert through their exact time
         // rather than by scaling the index.
-        project.project_fps = fps;
+        self.edit(|p| p.project_fps = fps);
         self.playhead = regrid(self.playhead, old, fps);
         self.selection = self
             .selection
@@ -580,13 +608,137 @@ impl App {
 
     // -- editing -------------------------------------------------------
 
-    pub fn snapshot(&mut self) {
-        if let Some(p) = &self.project {
-            self.undo.push(p.clone());
+    /// Change the edit. **The only way to change the edit.**
+    ///
+    /// Everything an edit implies happens here and nowhere else: the undo
+    /// entry, the unsaved marker that drives the title bar and the recovery
+    /// snapshot, the playhead landing on a kept frame, the mix the audio
+    /// callback reads. Before this existed each caller did its own subset, and
+    /// the subsets disagreed — a crop drag or a gain change left `unsaved`
+    /// false, so autosave never wrote, and closing the window discarded the
+    /// snapshot on the grounds that there was nothing to lose. Nine of the
+    /// fifteen edit paths were wrong in one direction or the other.
+    ///
+    /// The closure gets the project because the alternative — mutate first,
+    /// tell the app afterwards — is the arrangement that produced the bug.
+    pub fn edit(&mut self, f: impl FnOnce(&mut Project)) {
+        self.apply_edit(None, f);
+    }
+
+    /// An edit from a control that produces one call per frame while it is
+    /// being dragged.
+    ///
+    /// Consecutive edits from the same control fold into one undo entry, so a
+    /// two-second drag of a gain slider is one Ctrl+Z rather than a hundred and
+    /// twenty — which would also push everything else off a stack that holds a
+    /// hundred. See [`COALESCE_WINDOW`] for what "consecutive" means.
+    pub fn edit_continuous(&mut self, control: Control, f: impl FnOnce(&mut Project)) {
+        self.apply_edit(Some(control), f);
+    }
+
+    fn apply_edit(&mut self, control: Option<Control>, f: impl FnOnce(&mut Project)) {
+        let Some(before) = self.project.clone() else {
+            return;
+        };
+        // A new entry unless this is the same control still moving. The very
+        // first call of a drag cannot coalesce — whatever the user touched
+        // before was something else — so the pre-drag state is always kept.
+        let coalesce = control.is_some()
+            && self.last_control == control
+            && self.last_edit_at.elapsed() < COALESCE_WINDOW;
+        if !coalesce {
+            self.undo.push(before);
         }
+        self.last_control = control;
+        self.last_edit_at = Instant::now();
+
+        if let Some(p) = self.project.as_mut() {
+            f(p);
+        }
+        self.after_edit();
+    }
+
+    // -- the edit vocabulary -------------------------------------------
+    //
+    // One named method per thing the UI can change. The widgets do not touch
+    // `Project`: they read it, draw, and ask for a change by name. That is what
+    // makes the list of edits enumerable — `app/tests/undo_entry_points.rs`
+    // walks it — and what keeps a new control from quietly acquiring its own
+    // idea of what an edit implies.
+
+    pub fn set_aspect_and_crop(
+        &mut self,
+        mode: clip_core::AspectMode,
+        crop: Option<clip_core::CropRect>,
+    ) {
+        self.edit(|p| {
+            p.aspect_mode = mode;
+            p.crop = crop;
+        });
+    }
+
+    /// One frame of a crop drag: continuous, so the gesture is one undo entry.
+    pub fn drag_crop(&mut self, rect: clip_core::CropRect) {
+        if self.project.as_ref().and_then(|p| p.crop) == Some(rect) {
+            return;
+        }
+        self.edit_continuous(Control::CropRect, |p| p.crop = Some(rect));
+    }
+
+    pub fn set_original_audio_source(&mut self, source: clip_core::AudioSourceSelection) {
+        self.edit(|p| p.original_audio.source = source);
+    }
+
+    pub fn set_original_gain(&mut self, db: f32) {
+        self.edit_continuous(Control::OriginalGain, |p| p.original_audio.gain_db = db);
+    }
+
+    pub fn set_track_gain(&mut self, index: usize, db: f32) {
+        self.edit_continuous(Control::TrackGain(index), |p| {
+            if let Some(t) = p.added_tracks.get_mut(index) {
+                t.gain_db = db;
+            }
+        });
+    }
+
+    /// Seconds on the output timeline. Negative is legal: the track starts
+    /// before the clip does, and export handles it with an input seek.
+    pub fn set_track_offset(&mut self, index: usize, seconds: f32) {
+        self.edit_continuous(Control::TrackOffset(index), |p| {
+            if let Some(t) = p.added_tracks.get_mut(index) {
+                t.offset = clip_core::RationalTime::from_seconds_f64(seconds as f64);
+            }
+        });
+    }
+
+    pub fn set_track_fade_out(&mut self, index: usize, on: bool) {
+        self.edit(|p| {
+            if let Some(t) = p.added_tracks.get_mut(index) {
+                t.fade_out = on;
+            }
+        });
+    }
+
+    pub fn set_output_settings(&mut self, settings: clip_core::OutputSettings) {
+        self.edit(|p| p.output = settings);
+    }
+
+    pub fn set_crf(&mut self, crf: u32) {
+        self.edit_continuous(Control::Crf, |p| {
+            p.output.quality = clip_core::Quality::Crf(crf)
+        });
+    }
+
+    /// End any run of continuous edits, so the next one starts a fresh undo
+    /// entry. Anything that moves the project wholesale — undo, redo, opening
+    /// a file — calls this: without it the first slider nudge after an undo
+    /// would fold into the entry the undo just walked back to.
+    fn end_edit_run(&mut self) {
+        self.last_control = None;
     }
 
     pub fn undo(&mut self) {
+        self.end_edit_run();
         if let Some(p) = self.project.as_mut() {
             if let Some(prev) = self.undo.undo(p.clone()) {
                 *p = prev;
@@ -599,6 +751,7 @@ impl App {
     }
 
     pub fn redo(&mut self) {
+        self.end_edit_run();
         if let Some(p) = self.project.as_mut() {
             if let Some(next) = self.undo.redo(p.clone()) {
                 *p = next;
@@ -608,9 +761,9 @@ impl App {
         }
     }
 
-    /// Called after anything that changes the edit: keeps the playhead on a
-    /// kept frame and rebuilds the mix the audio callback reads.
-    pub fn after_edit(&mut self) {
+    /// The bookkeeping every edit needs. Private: [`edit`](Self::edit) is the
+    /// door, and a caller that could reach this could also forget to.
+    fn after_edit(&mut self) {
         self.unsaved = true;
         let timeline = self.timeline();
         if !timeline.is_empty() && timeline.to_output(self.playhead).is_none() {
@@ -880,13 +1033,9 @@ impl App {
         if self.tools.is_none() || self.cache.is_none() || self.project.is_none() {
             return;
         }
-        self.snapshot();
-        let Some(project) = self.project.as_mut() else {
-            return;
-        };
         let track = clip_core::AudioTrack::new(path.clone());
         let id = track.id;
-        project.added_tracks.push(track);
+        self.edit(|p| p.added_tracks.push(track));
         self.spawn_track_load(id, path);
     }
 
@@ -902,19 +1051,18 @@ impl App {
         {
             return;
         }
-        self.snapshot();
-        let Some(p) = self.project.as_mut() else {
-            return;
-        };
-        let removed = p.added_tracks.remove(index);
+        let mut removed = None;
+        self.edit(|p| removed = Some(p.added_tracks.remove(index)));
         // The decoded samples go, because holding every removed track's PCM
         // for the session costs ~115 MB per five minutes of stereo. The
         // scratch file on disk stays, so an undo reads the audio back instead
         // of restoring a silent track — see `reload_missing_track_audio`. It
         // is a cache artifact and is cleaned up with the rest of the source's
         // cache entry rather than being tied to the undo stack.
-        self.track_pcm.remove(&removed.id);
-        self.refresh_mix();
+        if let Some(removed) = removed {
+            self.track_pcm.remove(&removed.id);
+            self.refresh_mix();
+        }
     }
 
     /// A decode finished. The track it was for may have moved, or be gone.

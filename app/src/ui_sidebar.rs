@@ -128,15 +128,19 @@ fn common_rates(current: Rational) -> Vec<Rational> {
 
 fn crop_section(app: &mut App, ui: &mut egui::Ui) {
     heading(ui, "CROP");
-    let Some(project) = app.project.as_mut() else {
+    // Read out what is being drawn, draw against copies, then commit through
+    // `App::edit`. Holding `&mut Project` across the widgets is what made every
+    // control here mutate the project behind the app's back.
+    let Some(project) = app.project.as_ref() else {
         return;
     };
     let bounds = project.source.display_size();
+    let was = (project.aspect_mode, project.crop);
     let mut crop_tool = app.crop_tool;
     ui.checkbox(&mut crop_tool, "Crop tool  (C)");
     app.crop_tool = crop_tool;
 
-    let mut mode = project.aspect_mode;
+    let mut mode = was.0;
     let mut apply: Option<Rational> = None;
     ui.horizontal_wrapped(|ui| {
         if ui
@@ -172,17 +176,16 @@ fn crop_section(app: &mut App, ui: &mut egui::Ui) {
             AspectMode::Locked(pad_ratio)
         };
     }
-    project.aspect_mode = mode;
-
+    let mut crop = was.1;
     if let Some(ratio) = apply {
-        let current = project.crop.unwrap_or_else(|| crop::full_frame(bounds));
-        project.crop = Some(crop::apply_ratio(current, ratio, bounds));
+        let current = crop.unwrap_or_else(|| crop::full_frame(bounds));
+        crop = Some(crop::apply_ratio(current, ratio, bounds));
         // Picking a ratio is a request to crop, so show the handles rather
         // than making the user find the checkbox to see what they just did.
         app.crop_tool = true;
     }
 
-    if let Some(c) = project.crop {
+    if let Some(c) = crop {
         ui.label(
             RichText::new(crop::describe(c))
                 .monospace()
@@ -190,7 +193,7 @@ fn crop_section(app: &mut App, ui: &mut egui::Ui) {
                 .color(Color32::from_gray(190)),
         );
         if ui.button("Reset crop").clicked() {
-            project.crop = None;
+            crop = None;
         }
     } else {
         ui.label(
@@ -199,21 +202,39 @@ fn crop_section(app: &mut App, ui: &mut egui::Ui) {
                 .color(Color32::from_gray(140)),
         );
     }
-    let (ow, oh) = project.output_size();
-    ui.label(
-        RichText::new(format!("Output {ow}×{oh}"))
-            .size(11.0)
-            .color(Color32::from_gray(160)),
-    );
+
+    if (mode, crop) != was {
+        app.set_aspect_and_crop(mode, crop);
+    }
+
+    // Read again: the label describes the project after the edit, not before.
+    if let Some((ow, oh)) = app.project.as_ref().map(|p| p.output_size()) {
+        ui.label(
+            RichText::new(format!("Output {ow}×{oh}"))
+                .size(11.0)
+                .color(Color32::from_gray(160)),
+        );
+    }
+}
+
+/// One change the audio section asks for. Collected while drawing and applied
+/// afterwards, because a widget needs `&mut` to the value it is showing and the
+/// project cannot be borrowed and edited at the same time.
+enum AudioChange {
+    Source(AudioSourceSelection),
+    OriginalGain(f32),
+    TrackGain(usize, f32),
+    TrackOffset(usize, f32),
+    TrackFade(usize, bool),
 }
 
 fn audio_section(app: &mut App, ui: &mut egui::Ui) {
     heading(ui, "AUDIO");
-    let mut changed = false;
+    let mut change: Option<AudioChange> = None;
     let mut remove: Option<usize> = None;
     let mut add = false;
     {
-        let Some(project) = app.project.as_mut() else {
+        let Some(project) = app.project.as_ref() else {
             return;
         };
         let streams = project.source.audio_streams.clone();
@@ -224,12 +245,12 @@ fn audio_section(app: &mut App, ui: &mut egui::Ui) {
                     .color(Color32::from_gray(140)),
             );
         } else {
-            let sel = &mut project.original_audio.source;
+            let mut sel = project.original_audio.source;
             let label = match sel {
                 AudioSourceSelection::None => "Muted".to_string(),
                 AudioSourceSelection::MixAll => "All streams".to_string(),
                 AudioSourceSelection::Stream(i) => streams
-                    .get(*i)
+                    .get(i)
                     .map(|s| s.label())
                     .unwrap_or_else(|| format!("Stream {i}")),
             };
@@ -237,31 +258,31 @@ fn audio_section(app: &mut App, ui: &mut egui::Ui) {
                 .selected_text(label)
                 .width(200.0)
                 .show_ui(ui, |ui| {
-                    changed |= ui
-                        .selectable_value(sel, AudioSourceSelection::None, "Muted")
-                        .changed();
+                    ui.selectable_value(&mut sel, AudioSourceSelection::None, "Muted");
                     for (i, s) in streams.iter().enumerate() {
-                        changed |= ui
-                            .selectable_value(sel, AudioSourceSelection::Stream(i), s.label())
-                            .changed();
+                        ui.selectable_value(&mut sel, AudioSourceSelection::Stream(i), s.label());
                     }
                     if streams.len() > 1 {
                         // OBS records desktop and mic separately; defaulting to
                         // one of them silently drops the other.
-                        changed |= ui
-                            .selectable_value(
-                                sel,
-                                AudioSourceSelection::MixAll,
-                                "All streams (desktop + mic)",
-                            )
-                            .changed();
+                        ui.selectable_value(
+                            &mut sel,
+                            AudioSourceSelection::MixAll,
+                            "All streams (desktop + mic)",
+                        );
                     }
                 });
-            changed |= gain_slider(ui, "Original", &mut project.original_audio.gain_db);
+            if sel != project.original_audio.source {
+                change = Some(AudioChange::Source(sel));
+            }
+            let mut gain = project.original_audio.gain_db;
+            if gain_slider(ui, "Original", &mut gain) {
+                change = Some(AudioChange::OriginalGain(gain));
+            }
         }
 
         ui.add_space(6.0);
-        for (i, track) in project.added_tracks.iter_mut().enumerate() {
+        for (i, track) in project.added_tracks.iter().enumerate() {
             ui.push_id(i, |ui| {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(track.name()).size(11.0).strong());
@@ -269,7 +290,10 @@ fn audio_section(app: &mut App, ui: &mut egui::Ui) {
                         remove = Some(i);
                     }
                 });
-                changed |= gain_slider(ui, "Gain", &mut track.gain_db);
+                let mut gain = track.gain_db;
+                if gain_slider(ui, "Gain", &mut gain) {
+                    change = Some(AudioChange::TrackGain(i, gain));
+                }
                 let mut offset = track.offset.as_f64() as f32;
                 if ui
                     .add(
@@ -279,26 +303,35 @@ fn audio_section(app: &mut App, ui: &mut egui::Ui) {
                     )
                     .changed()
                 {
-                    // Negative offsets are legal: the track starts before the
-                    // clip does, and export handles it with an input seek.
-                    track.offset = clip_core::RationalTime::from_seconds_f64(offset as f64);
-                    changed = true;
+                    change = Some(AudioChange::TrackOffset(i, offset));
                 }
-                changed |= ui
-                    .checkbox(&mut track.fade_out, "Fade out at end")
-                    .changed();
+                let mut fade = track.fade_out;
+                if ui.checkbox(&mut fade, "Fade out at end").changed() {
+                    change = Some(AudioChange::TrackFade(i, fade));
+                }
             });
         }
         if ui.button("Add audio track…").clicked() {
             add = true;
         }
     }
+
     if let Some(i) = remove {
         app.remove_audio_track(i);
     } else if add {
         app.add_audio_track();
-    } else if changed {
-        app.refresh_mix();
+    } else if let Some(change) = change {
+        apply_audio_change(app, change);
+    }
+}
+
+fn apply_audio_change(app: &mut App, change: AudioChange) {
+    match change {
+        AudioChange::Source(sel) => app.set_original_audio_source(sel),
+        AudioChange::TrackFade(i, on) => app.set_track_fade_out(i, on),
+        AudioChange::OriginalGain(db) => app.set_original_gain(db),
+        AudioChange::TrackGain(i, db) => app.set_track_gain(i, db),
+        AudioChange::TrackOffset(i, secs) => app.set_track_offset(i, secs),
     }
 }
 
@@ -324,25 +357,26 @@ fn output_section(app: &mut App, ui: &mut egui::Ui) {
         .first()
         .map(|e| e.label().to_string())
         .unwrap_or_default();
-    let mut preset_changed = false;
-    {
-        let Some(project) = app.project.as_mut() else {
+    let mut crf_change: Option<u32> = None;
+    let settings = {
+        let Some(project) = app.project.as_ref() else {
             return;
         };
+        let was = project.output.clone();
+        let mut settings = was.clone();
+
         // Validated bundles, not an independent container/codec matrix.
         egui::ComboBox::from_id_salt("preset")
-            .selected_text(project.output.preset.label())
+            .selected_text(settings.preset.label())
             .width(200.0)
             .show_ui(ui, |ui| {
                 for p in OutputPreset::ALL {
-                    preset_changed |= ui
-                        .selectable_value(&mut project.output.preset, *p, p.label())
-                        .changed();
+                    ui.selectable_value(&mut settings.preset, *p, p.label());
                 }
             });
 
-        if project.output.preset.has_video() {
-            let mut long_edge = project.output.long_edge.unwrap_or(0);
+        if settings.preset.has_video() {
+            let mut long_edge = settings.long_edge.unwrap_or(0);
             ui.horizontal(|ui| {
                 ui.label("Long edge");
                 egui::ComboBox::from_id_salt("long-edge")
@@ -358,17 +392,19 @@ fn output_section(app: &mut App, ui: &mut egui::Ui) {
                         }
                     });
             });
-            project.output.long_edge = (long_edge > 0).then_some(long_edge);
+            settings.long_edge = (long_edge > 0).then_some(long_edge);
         }
 
-        if project.output.preset.uses_crf() {
-            let preset = project.output.preset;
-            let mut crf = project.output.quality.crf_for(preset);
+        if settings.preset.uses_crf() {
+            let preset = settings.preset;
+            let mut crf = settings.quality.crf_for(preset);
+            // The CRF slider is the one control here that is dragged, so it
+            // reports separately and coalesces; everything else is a click.
             if ui
                 .add(egui::Slider::new(&mut crf, 12..=40).text("CRF"))
                 .changed()
             {
-                project.output.quality = Quality::Crf(crf);
+                crf_change = Some(crf);
             }
             ui.horizontal(|ui| {
                 for (label, bucket) in [
@@ -377,22 +413,30 @@ fn output_section(app: &mut App, ui: &mut egui::Ui) {
                     ("High", QualityBucket::High),
                 ] {
                     if ui.small_button(label).clicked() {
-                        project.output.quality = Quality::Bucket(bucket);
+                        settings.quality = Quality::Bucket(bucket);
                     }
                 }
             });
         }
 
-        if project.output.preset.supports_hardware() && hw_available {
+        if settings.preset.supports_hardware() && hw_available {
             ui.checkbox(
-                &mut project.output.use_hardware_encoder,
+                &mut settings.use_hardware_encoder,
                 format!("Fast export ({hw_label})"),
             );
         }
-    }
+        let preset_changed = was.preset != settings.preset;
+        (settings != was).then_some((settings, preset_changed))
+    };
 
-    if preset_changed {
-        app.output_path = app.project.as_ref().map(crate::export::suggested_output);
+    if let Some((settings, preset_changed)) = settings {
+        app.set_output_settings(settings);
+        if preset_changed {
+            // The suggested name carries the preset's extension, so it follows.
+            app.output_path = app.project.as_ref().map(crate::export::suggested_output);
+        }
+    } else if let Some(crf) = crf_change {
+        app.set_crf(crf);
     }
 
     ui.add_space(4.0);

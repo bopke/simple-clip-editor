@@ -528,7 +528,9 @@ impl AudioTrack {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// `PartialEq` so the sidebar can draw against a copy and commit only what
+/// actually moved — comparing is how a widget's change becomes one edit.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct OutputSettings {
     pub preset: OutputPreset,
     /// None = native crop dimensions.

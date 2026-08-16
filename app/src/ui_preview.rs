@@ -242,7 +242,6 @@ fn crop_overlay(
                 })
                 .or_else(|| r.contains(pos).then_some(Handle::Move));
             if let Some(handle) = handle {
-                app.snapshot();
                 app.crop_drag = Some(CropDrag {
                     handle,
                     grab: pos - r.min,
@@ -299,8 +298,11 @@ fn handle_pos(r: Rect, h: Handle) -> Pos2 {
     }
 }
 
+/// One frame of a crop drag.
+///
+/// Unlike before, this is an *edit*: it used to write straight into the
+/// project, so dragging a crop rectangle for an hour left the app believing
+/// nothing had changed — no autosave, no `•`, and a snapshot discarded on exit.
 pub fn set_crop(app: &mut App, rect: CropRect) {
-    if let Some(p) = app.project.as_mut() {
-        p.crop = Some(rect);
-    }
+    app.drag_crop(rect);
 }

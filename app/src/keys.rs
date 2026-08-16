@@ -150,22 +150,14 @@ fn shuttle(app: &mut App, direction: i32) {
 
 pub fn set_in(app: &mut App) {
     let at = app.playhead.to_time(app.fps());
-    app.snapshot();
-    if let Some(p) = app.project.as_mut() {
-        edits::set_in(&mut p.segments, at);
-    }
-    app.after_edit();
+    app.edit(|p| edits::set_in(&mut p.segments, at));
 }
 
 pub fn set_out(app: &mut App) {
     // The playhead frame is kept, so the out-point is where the next frame
     // would start.
     let end = app.playhead.saturating_add(1).to_time(app.fps());
-    app.snapshot();
-    if let Some(p) = app.project.as_mut() {
-        edits::set_out(&mut p.segments, end);
-    }
-    app.after_edit();
+    app.edit(|p| edits::set_out(&mut p.segments, end));
 }
 
 /// With a selection, `X` removes exactly that range. Without one, it removes
@@ -181,12 +173,8 @@ pub fn delete_range(app: &mut App) {
         }),
     };
     let Some((from, to)) = range else { return };
-    app.snapshot();
-    if let Some(p) = app.project.as_mut() {
-        edits::delete_range(&mut p.segments, from, to);
-    }
+    app.edit(|p| edits::delete_range(&mut p.segments, from, to));
     app.selection = None;
-    app.after_edit();
 }
 
 /// Per-frame shuttle stepping for speeds other than ±1.

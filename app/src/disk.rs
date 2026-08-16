@@ -166,9 +166,15 @@ mod tests {
         assert!(available > 0);
 
         // The path being asked about does not have to exist — the output file
-        // is the whole point, and it never does yet.
-        let not_yet = dir.join("no-such-dir").join("export.mp4");
-        assert_eq!(available_bytes(&not_yet), Some(available));
+        // is the whole point, and it never does yet. Compared loosely: this is
+        // a live volume and something else on the machine writes to it between
+        // the two calls.
+        let not_yet = available_bytes(&dir.join("no-such-dir").join("export.mp4"))
+            .expect("a path that does not exist yet still names a volume");
+        assert!(
+            not_yet.abs_diff(available) < 1_000_000_000,
+            "{not_yet} and {available} are not the same volume"
+        );
     }
 
     #[test]
