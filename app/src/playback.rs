@@ -445,13 +445,23 @@ fn build_stream(
 // Video decode-ahead
 // ---------------------------------------------------------------------------
 
+/// How many decoded frames may be waiting for the UI at once.
+const DECODE_AHEAD: usize = 8;
+
 /// Sequential rawvideo from the proxy with a small decode-ahead buffer. One
 /// ffmpeg process for a run of frames, restarted when playback crosses a cut.
+///
+/// Frame buffers cycle rather than being allocated and copied per frame: the
+/// decoder fills one, hands it over, and gets it back once the UI has finished
+/// with it. At 854×480 RGBA that is ~1.6 MB a frame, so at 60 fps the old
+/// clone-per-frame was ~100 MB/s of allocate-copy-free for data read once.
 pub struct VideoStream {
     pub start_frame: FrameIdx,
     pub width: u32,
     pub height: u32,
     rx: Receiver<Vec<u8>>,
+    /// Frame buffers going back to the decoder to be filled again.
+    spare_tx: Sender<Vec<u8>>,
     cancel: Cancel,
     next: u64,
     pub current: Option<(FrameIdx, Arc<Vec<u8>>)>,
@@ -466,7 +476,10 @@ impl VideoStream {
         width: u32,
         height: u32,
     ) -> VideoStream {
-        let (tx, rx) = bounded::<Vec<u8>>(8);
+        let (tx, rx) = bounded::<Vec<u8>>(DECODE_AHEAD);
+        // Deeper than the decode-ahead buffer so a return never has to be
+        // dropped just because the decoder has not asked for one yet.
+        let (spare_tx, spare_rx) = bounded::<Vec<u8>>(DECODE_AHEAD + 2);
         let cancel = Cancel::new();
         let args = command::proxy_stream_args(&proxy, start.to_time(fps), fps);
         let frame_bytes = (width * height * 4) as usize;
@@ -475,7 +488,7 @@ impl VideoStream {
         std::thread::Builder::new()
             .name("video-stream".into())
             .spawn(move || {
-                let _ = tools.stream_frames(&args, &cancel2, frame_bytes, |frame| {
+                let _ = tools.stream_frames(&args, &cancel2, frame_bytes, &spare_rx, |frame| {
                     // Blocks when the buffer is full, which is exactly the
                     // decode-ahead limit.
                     tx.send(frame).is_ok()
@@ -487,6 +500,7 @@ impl VideoStream {
             width,
             height,
             rx,
+            spare_tx,
             cancel,
             next: 0,
             current: None,
@@ -506,7 +520,7 @@ impl VideoStream {
                 Ok(bytes) => {
                     let idx = FrameIdx(self.start_frame.0 + self.next);
                     self.next += 1;
-                    self.current = Some((idx, Arc::new(bytes)));
+                    self.show(idx, bytes);
                     changed = true;
                     if idx.0 >= target.0 {
                         break;
@@ -516,6 +530,23 @@ impl VideoStream {
             }
         }
         changed
+    }
+
+    /// Make `bytes` the displayed frame and send the one it replaces back to
+    /// the decoder.
+    ///
+    /// Catching up during a scrub passes several frames through here, so this
+    /// is where the buffers of the ones nobody saw get recycled as well.
+    /// `Arc::try_unwrap` is what makes it safe: the UI clones the `Arc` to
+    /// upload a texture and drops it in the same frame, but if it happens to
+    /// still hold one the buffer is simply dropped instead of reused.
+    fn show(&mut self, idx: FrameIdx, bytes: Vec<u8>) {
+        if let Some((_, prev)) = self.current.take() {
+            if let Ok(buf) = Arc::try_unwrap(prev) {
+                let _ = self.spare_tx.try_send(buf);
+            }
+        }
+        self.current = Some((idx, Arc::new(bytes)));
     }
 
     pub fn stop(&self) {
@@ -781,6 +812,77 @@ mod tests {
             lost > 200.0,
             "expected the old arithmetic to drift, lost {lost}"
         );
+    }
+
+    /// A stream wired up by hand, so the buffer cycle can be driven without an
+    /// ffmpeg to decode anything.
+    fn fake_stream(frames: usize) -> (VideoStream, Sender<Vec<u8>>, Receiver<Vec<u8>>) {
+        let (tx, rx) = bounded::<Vec<u8>>(frames + 1);
+        let (spare_tx, spare_rx) = bounded::<Vec<u8>>(frames + 1);
+        let stream = VideoStream {
+            start_frame: FrameIdx(0),
+            width: 4,
+            height: 1,
+            rx,
+            spare_tx,
+            cancel: Cancel::new(),
+            next: 0,
+            current: None,
+        };
+        (stream, tx, spare_rx)
+    }
+
+    /// At 854×480 RGBA a frame is ~1.6 MB, so allocating and copying one per
+    /// frame is ~100 MB/s at 60 fps for bytes that are read once. The buffers
+    /// go back to the decoder instead.
+    #[test]
+    fn frame_buffers_go_back_to_the_decoder() {
+        let (mut stream, tx, spare_rx) = fake_stream(4);
+
+        // The first frame has nothing to replace, so nothing comes back yet.
+        tx.send(vec![1u8; 16]).unwrap();
+        assert!(stream.advance_to(FrameIdx(0)));
+        assert!(spare_rx.try_recv().is_err(), "nothing to recycle yet");
+
+        // The second replaces the first, whose buffer is now the decoder's
+        // again — the same allocation, not a new one.
+        tx.send(vec![2u8; 16]).unwrap();
+        assert!(stream.advance_to(FrameIdx(1)));
+        let returned = spare_rx
+            .try_recv()
+            .expect("the displaced buffer comes back");
+        assert_eq!(returned, vec![1u8; 16]);
+        assert_eq!(stream.current.as_ref().unwrap().1.as_slice(), &[2u8; 16]);
+
+        // Catching up during a scrub passes several frames through at once;
+        // every one of them is recycled, not just the last.
+        for v in 3..=5u8 {
+            tx.send(vec![v; 16]).unwrap();
+        }
+        assert!(stream.advance_to(FrameIdx(4)));
+        assert_eq!(stream.current.as_ref().unwrap().0, FrameIdx(4));
+        let recycled: Vec<Vec<u8>> = spare_rx.try_iter().collect();
+        assert_eq!(recycled.len(), 3, "frames 1..3 all came back: {recycled:?}");
+    }
+
+    /// The UI clones the `Arc` to upload a texture. If it still holds one when
+    /// the frame is replaced, the buffer has to be dropped rather than handed
+    /// back to be overwritten under it.
+    #[test]
+    fn a_buffer_the_ui_still_holds_is_not_recycled() {
+        let (mut stream, tx, spare_rx) = fake_stream(2);
+
+        tx.send(vec![1u8; 16]).unwrap();
+        stream.advance_to(FrameIdx(0));
+        let held = stream.current.as_ref().unwrap().1.clone();
+
+        tx.send(vec![2u8; 16]).unwrap();
+        stream.advance_to(FrameIdx(1));
+        assert!(
+            spare_rx.try_recv().is_err(),
+            "a buffer with another reference must not be reused"
+        );
+        assert_eq!(held.as_slice(), &[1u8; 16], "and it is still intact");
     }
 
     #[test]

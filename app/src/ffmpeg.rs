@@ -6,6 +6,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use clip_core::progress::{ProgressParser, ProgressUpdate};
+use crossbeam_channel::Receiver;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -153,11 +154,19 @@ impl Tools {
 
     /// Read fixed-size rawvideo frames from ffmpeg's stdout as they arrive.
     /// `on_frame` returning false stops the stream (the consumer went away).
+    ///
+    /// Frames are handed over by move, and `spares` is where the consumer sends
+    /// buffers back when it has finished with them. This used to
+    /// `on_frame(buf.clone())` — a fresh allocation and a full copy of every
+    /// frame, ~100 MB/s at 854×480/60 for bytes that are read once and dropped.
+    /// A consumer with nothing to return simply sends nothing and each frame
+    /// costs one allocation instead of a copy.
     pub fn stream_frames(
         &self,
         args: &[String],
         cancel: &Cancel,
         frame_bytes: usize,
+        spares: &Receiver<Vec<u8>>,
         mut on_frame: impl FnMut(Vec<u8>) -> bool,
     ) -> Result<()> {
         let mut child = Command::new(&self.ffmpeg)
@@ -170,7 +179,7 @@ impl Tools {
         let mut stdout = child.stdout.take().expect("piped");
         let id = cancel.install(child)?;
 
-        let mut buf = vec![0u8; frame_bytes];
+        let mut buf = take_buffer(spares, frame_bytes);
         loop {
             if cancel.is_cancelled() {
                 break;
@@ -186,9 +195,12 @@ impl Tools {
             if filled < frame_bytes {
                 break;
             }
-            if !on_frame(buf.clone()) {
+            // `take` leaves an empty Vec behind rather than allocating one, and
+            // the next buffer comes from the consumer if it has returned any.
+            if !on_frame(std::mem::take(&mut buf)) {
                 break;
             }
+            buf = take_buffer(spares, frame_bytes);
         }
         cancel.abort();
         let _ = cancel.wait(id);
@@ -257,6 +269,27 @@ impl Tools {
             .copied()
             .filter(|e| text.contains(e.ffmpeg_name()))
             .collect()
+    }
+}
+
+/// A buffer to decode the next frame into: a returned one if the consumer has
+/// sent any back, otherwise a new one.
+///
+/// A recycled buffer is handed back without being cleared. Every byte of it is
+/// overwritten before anyone reads it — that is what `frame_bytes` means — and
+/// zeroing it first would put back the memory traffic this exists to avoid.
+fn take_buffer(spares: &Receiver<Vec<u8>>, frame_bytes: usize) -> Vec<u8> {
+    match spares.try_recv() {
+        Ok(mut buf) => {
+            // A buffer from a stream at a different resolution is the one case
+            // where it has to be resized rather than trusted.
+            if buf.len() != frame_bytes {
+                buf.clear();
+                buf.resize(frame_bytes, 0);
+            }
+            buf
+        }
+        Err(_) => vec![0u8; frame_bytes],
     }
 }
 
@@ -381,5 +414,33 @@ mod tests {
     #[test]
     fn tail_keeps_the_last_lines() {
         assert_eq!(tail("a\n\nb\nc\nd\ne"), "b; c; d; e");
+    }
+
+    /// The decoder side of the frame-buffer cycle: reuse what came back, and
+    /// only allocate when there is nothing to reuse.
+    #[test]
+    fn a_returned_buffer_is_used_instead_of_a_new_one() {
+        let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
+
+        // Nothing returned yet: a buffer of the right size, zeroed.
+        let fresh = take_buffer(&rx, 8);
+        assert_eq!(fresh, vec![0u8; 8]);
+
+        // A returned buffer is handed straight back, contents and all — every
+        // byte is overwritten before it is read, and clearing it would put back
+        // the memory traffic this exists to avoid.
+        tx.send(vec![7u8; 8]).unwrap();
+        assert_eq!(take_buffer(&rx, 8), vec![7u8; 8]);
+
+        // One from a stream at a different resolution is the case where it has
+        // to be resized rather than trusted.
+        tx.send(vec![7u8; 4]).unwrap();
+        assert_eq!(take_buffer(&rx, 8).len(), 8);
+        tx.send(vec![7u8; 32]).unwrap();
+        assert_eq!(take_buffer(&rx, 8).len(), 8);
+
+        // A disconnected consumer is not an error; the decoder just allocates.
+        drop(tx);
+        assert_eq!(take_buffer(&rx, 8).len(), 8);
     }
 }
