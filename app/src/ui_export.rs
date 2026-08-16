@@ -1,10 +1,11 @@
 //! Modal overlays: the export dialog, HDR notice, and error toasts.
 
-use crate::app::App;
+use crate::app::{App, PendingOpen};
 use egui::{Color32, RichText};
 
 pub fn overlays(app: &mut App, ctx: &egui::Context) {
     recovery_notice(app, ctx);
+    discard_confirm(app, ctx);
     export_confirm(app, ctx);
     export_dialog(app, ctx);
     hdr_notice(app, ctx);
@@ -94,6 +95,12 @@ fn export_confirm(app: &mut App, ctx: &egui::Context) {
 /// Unsaved work from a session that ended badly. Shown before anything else,
 /// because opening a file would otherwise throw away the very thing being
 /// offered.
+///
+/// A real [`egui::Modal`], not a window that merely sits on top. The comment
+/// here used to claim it blocked everything behind it while the toolbar and
+/// Ctrl+O stayed live — so the one action the notice exists to prevent was
+/// still one click away. Keyboard shortcuts are held off separately, in
+/// [`crate::keys::handle`], since a backdrop only stops the pointer.
 fn recovery_notice(app: &mut App, ctx: &egui::Context) {
     let Some(pending) = &app.pending_recovery else {
         return;
@@ -101,33 +108,74 @@ fn recovery_notice(app: &mut App, ctx: &egui::Context) {
     let label = pending.label();
     let mut restore = false;
     let mut discard = false;
-    egui::Window::new("Unsaved work")
-        .collapsible(false)
-        .resizable(false)
-        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
-        .show(ctx, |ui| {
-            ui.set_max_width(420.0);
-            ui.label(format!(
-                "Clip last closed with unsaved changes to {label} — either \
-                 without saving, or without closing at all."
-            ));
-            ui.label(
-                RichText::new(
-                    "Restoring opens it as an unsaved edit — save it somewhere to keep it.",
-                )
+    egui::Modal::new(egui::Id::new("recovery-notice")).show(ctx, |ui| {
+        ui.set_max_width(420.0);
+        ui.heading("Unsaved work");
+        ui.add_space(4.0);
+        ui.label(format!(
+            "Clip last closed with unsaved changes to {label} — either \
+             without saving, or without closing at all."
+        ));
+        ui.label(
+            RichText::new("Restoring opens it as an unsaved edit — save it somewhere to keep it.")
                 .size(11.0)
                 .color(Color32::from_gray(150)),
-            );
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                restore = ui.button("Restore").clicked();
-                discard = ui.button("Discard").clicked();
-            });
+        );
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            restore = ui.button("Restore").clicked();
+            discard = ui.button("Discard").clicked();
         });
+    });
     if restore {
         app.restore_recovery();
     } else if discard {
         app.discard_recovery();
+    }
+}
+
+/// The question nothing used to ask: this open will throw away work that is
+/// not saved anywhere.
+fn discard_confirm(app: &mut App, ctx: &egui::Context) {
+    let Some(intent) = app.confirm_discard.clone() else {
+        return;
+    };
+    let what = match &intent {
+        PendingOpen::Dialog => "Opening another file".to_string(),
+        PendingOpen::Path(path) => format!(
+            "Opening {}",
+            path.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.display().to_string())
+        ),
+        PendingOpen::Recovery => "Restoring the recovered edit".to_string(),
+    };
+
+    let mut save = false;
+    let mut discard = false;
+    let mut cancel = false;
+    egui::Modal::new(egui::Id::new("discard-confirm")).show(ctx, |ui| {
+        ui.set_max_width(440.0);
+        ui.heading("Unsaved changes");
+        ui.add_space(4.0);
+        ui.label(format!(
+            "{what} closes the edit you have open, and it has changes that are \
+             not saved to a file."
+        ));
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            save = ui.button("Save, then open").clicked();
+            discard = ui.button("Discard changes").clicked();
+            cancel = ui.button("Cancel").clicked();
+        });
+    });
+
+    if save {
+        app.save_and_open();
+    } else if discard {
+        app.discard_and_open();
+    } else if cancel {
+        app.cancel_pending_open();
     }
 }
 

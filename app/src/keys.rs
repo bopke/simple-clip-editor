@@ -29,6 +29,13 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
     if ctx.egui_wants_keyboard_input() {
         return;
     }
+    // A blocking question is on screen. `egui::Modal`'s backdrop stops the
+    // pointer and nothing else, so without this the shortcuts behind it stay
+    // live — and Ctrl+O during the recovery notice would throw away the very
+    // edit being offered back, which is what the notice exists to prevent.
+    if app.pending_recovery.is_some() || app.confirm_discard.is_some() {
+        return;
+    }
     // Modifiers come from the event, not from the global input state: the
     // two can disagree, and the event is what the user actually pressed.
     let pressed: Vec<(Key, egui::Modifiers)> = ctx.input(|i| {

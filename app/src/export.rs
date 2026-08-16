@@ -8,7 +8,7 @@
 use crate::cache::ExportTemp;
 use crate::ffmpeg::{Cancel, Tools};
 use crate::jobs::Msg;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clip_core::command::{self, HwEncoder};
 use clip_core::progress::fraction;
 use clip_core::Project;
@@ -20,6 +20,37 @@ use std::sync::{Arc, Mutex};
 /// regardless of clip length — a small fixed slice of the progress bar.
 const PHASE_B_SHARE: f32 = 0.12;
 
+/// Where Phase B writes while it is working.
+///
+/// Beside the output rather than in the cache, so the rename at the end is
+/// within one directory and cannot fail across volumes — the export scratch
+/// lives in the cache dir, which is routinely on a different disk from the
+/// video someone is exporting to an external drive.
+///
+/// The extension is kept, and kept last: ffmpeg picks the muxer from it, and
+/// `clip_edit.mp4.part` would leave it guessing.
+fn staging_path(out_path: &Path) -> PathBuf {
+    let stem = out_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "export".to_string());
+    match out_path.extension() {
+        Some(ext) => out_path.with_file_name(format!("{stem}.part.{}", ext.to_string_lossy())),
+        None => out_path.with_file_name(format!("{stem}.part")),
+    }
+}
+
+/// Move the finished file onto the name the user asked for.
+fn promote(staging: &Path, out_path: &Path) -> Result<()> {
+    // Windows will not rename onto an existing file. This is the one moment
+    // the export is allowed to remove the output: the replacement is complete
+    // and about to take its place.
+    #[cfg(windows)]
+    let _ = std::fs::remove_file(out_path);
+    std::fs::rename(staging, out_path)
+        .with_context(|| format!("moving the finished export to {}", out_path.display()))
+}
+
 pub fn run_export(
     tools: Tools,
     project: Project,
@@ -28,7 +59,16 @@ pub fn run_export(
     tx: Sender<Msg>,
     cancel: Cancel,
 ) {
-    match export(&tools, &project, hw, &out_path, &tx, &cancel) {
+    // The export writes to a file of its own and only takes the user's
+    // filename once it has something to put there. Before this, a failure
+    // anywhere — a bad source, a full disk, an hw encoder the machine does not
+    // have — ran `remove_file(&out_path)` on a path Phase A had never touched,
+    // so picking an existing file in the save dialog and hitting a Phase A
+    // error deleted it. Nothing here removes anything it did not create.
+    let staging = staging_path(&out_path);
+    let result = export(&tools, &project, hw, &staging, &tx, &cancel)
+        .and_then(|()| promote(&staging, &out_path));
+    match result {
         Ok(()) => {
             let _ = tx.send(Msg::ExportProgress {
                 fraction: 1.0,
@@ -37,7 +77,7 @@ pub fn run_export(
             let _ = tx.send(Msg::ExportDone(Ok(out_path)));
         }
         Err(e) => {
-            let _ = std::fs::remove_file(&out_path);
+            let _ = std::fs::remove_file(&staging);
             let msg = if cancel.is_user_cancelled() {
                 "cancelled".to_string()
             } else {
@@ -408,6 +448,73 @@ mod tests {
         assert_eq!(preflight(&project, &as_dir, None).overwrite, None);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The failure that cost a user a file: pick an existing output in the save
+    /// dialog, hit Export, have Phase A fail — and the error handler deletes a
+    /// file ffmpeg never opened, because Phase B is where the output gets
+    /// written. Driven with a toolchain that cannot spawn, which is a Phase A
+    /// failure and needs no ffmpeg to reproduce.
+    #[test]
+    fn a_failed_export_leaves_an_existing_file_alone() {
+        let dir = dir("failed-export");
+        let project = project_with_source(&dir, 1000);
+
+        let out = dir.join("precious.mp4");
+        std::fs::write(&out, b"a video someone already has").unwrap();
+
+        let tools = crate::ffmpeg::Tools {
+            ffmpeg: dir.join("no-such-ffmpeg"),
+            ffprobe: dir.join("no-such-ffprobe"),
+            origin: crate::ffmpeg::Origin::Managed,
+        };
+        let (tx, rx) = crossbeam_channel::unbounded();
+        run_export(
+            tools,
+            project,
+            None,
+            out.clone(),
+            tx,
+            crate::ffmpeg::Cancel::new(),
+        );
+
+        let failed = rx
+            .into_iter()
+            .filter_map(|m| match m {
+                Msg::ExportDone(r) => Some(r),
+                _ => None,
+            })
+            .last()
+            .expect("the export reports how it went");
+        assert!(failed.is_err(), "this export cannot have succeeded");
+
+        assert_eq!(
+            std::fs::read(&out).unwrap(),
+            b"a video someone already has",
+            "a failed export destroyed a file it never wrote"
+        );
+        // And it took its own scratch file with it.
+        assert!(!staging_path(&out).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The staging name keeps the extension last, because ffmpeg chooses the
+    /// muxer from it — `clip_edit.mp4.part` would be a guess.
+    #[test]
+    fn the_staging_file_sits_beside_the_output_and_keeps_its_extension() {
+        assert_eq!(
+            staging_path(Path::new("/v/clip_edit.mp4")),
+            PathBuf::from("/v/clip_edit.part.mp4")
+        );
+        assert_eq!(
+            staging_path(Path::new("/v/no extension")),
+            PathBuf::from("/v/no extension.part")
+        );
+        // Same directory as the output: the rename at the end must not cross a
+        // volume, and the cache commonly lives on a different disk.
+        let out = Path::new("/v/clip_edit.mp4");
+        assert_eq!(staging_path(out).parent(), out.parent());
     }
 
     /// The real volume has room for a 1 MB estimate, so nothing should fire —

@@ -54,6 +54,22 @@ pub enum Control {
     Crf,
 }
 
+/// An open that is waiting on the user, because taking it would throw away
+/// unsaved work.
+///
+/// Parked rather than performed: the UI thread cannot block on a question, so
+/// the intent is held until the dialog is answered and then replayed.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PendingOpen {
+    /// Ask for a file, then open it.
+    Dialog,
+    /// A path already chosen — dropped on the window, or passed on the command
+    /// line.
+    Path(PathBuf),
+    /// The previous session's unsaved work.
+    Recovery,
+}
+
 /// What the first-run screen is doing.
 pub enum Boot {
     /// ffmpeg is available; the app is usable.
@@ -140,6 +156,9 @@ pub struct App {
     /// Unsaved work from the previous run — closed without saving, or not
     /// closed at all — waiting for the user to take it or leave it.
     pub pending_recovery: Option<recovery::Pending>,
+    /// An open held back because it would discard unsaved work. `Some` means
+    /// the user has been asked and has not answered yet.
+    pub confirm_discard: Option<PendingOpen>,
     /// Which control the last edit came from, and when — together they decide
     /// whether the next edit continues a gesture or starts a new undo entry.
     last_control: Option<Control>,
@@ -228,6 +247,7 @@ impl App {
             save_path: None,
             unsaved: false,
             pending_recovery: recovery::pending(),
+            confirm_discard: None,
             last_control: None,
             last_edit_at: Instant::now(),
             last_autosave: Instant::now(),
@@ -266,6 +286,13 @@ impl App {
     /// extension, so the user picks "the thing they want to work on" rather
     /// than first having to tell the app which menu item they meant.
     pub fn open_dialog(&mut self) {
+        if self.guard_unsaved(PendingOpen::Dialog) {
+            return;
+        }
+        self.open_dialog_now();
+    }
+
+    fn open_dialog_now(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter(
                 "Clip project or video",
@@ -286,14 +313,78 @@ impl App {
         else {
             return;
         };
-        self.open_path(path);
+        self.open_path_now(path);
     }
 
     pub fn open_path(&mut self, path: PathBuf) {
+        if self.guard_unsaved(PendingOpen::Path(path.clone())) {
+            return;
+        }
+        self.open_path_now(path);
+    }
+
+    fn open_path_now(&mut self, path: PathBuf) {
         if project_file::is_project_file(&path) {
             self.open_project_path(path);
         } else {
             self.import_source(path);
+        }
+    }
+
+    // -- guarding unsaved work -----------------------------------------
+
+    /// Hold `intent` back if taking it now would throw away unsaved work.
+    ///
+    /// Returns whether the caller should stop. Every route into
+    /// [`reset_for`](Self::reset_for) passes through here: opening a file,
+    /// dropping one on the window, and restoring a recovery snapshot all
+    /// replace the project outright, and none of them used to ask. Dropping a
+    /// video onto the window mid-edit was silent, immediate, unrecoverable
+    /// loss.
+    fn guard_unsaved(&mut self, intent: PendingOpen) -> bool {
+        if !self.unsaved || self.project.is_none() {
+            return false;
+        }
+        self.confirm_discard = Some(intent);
+        true
+    }
+
+    /// Answer the question with "throw it away".
+    pub fn discard_and_open(&mut self) {
+        let Some(intent) = self.confirm_discard.take() else {
+            return;
+        };
+        // Cleared before the open so nothing further down asks again — and so
+        // the snapshot of work the user has just chosen to abandon does not
+        // outlive the decision.
+        self.unsaved = false;
+        self.run_pending_open(intent);
+    }
+
+    /// Answer it with "save it first". A save that does not happen — the save
+    /// dialog was cancelled, the write failed — leaves the question standing
+    /// rather than proceeding to lose the work anyway.
+    pub fn save_and_open(&mut self) {
+        let Some(intent) = self.confirm_discard.clone() else {
+            return;
+        };
+        self.save_project();
+        if self.unsaved {
+            return;
+        }
+        self.confirm_discard = None;
+        self.run_pending_open(intent);
+    }
+
+    pub fn cancel_pending_open(&mut self) {
+        self.confirm_discard = None;
+    }
+
+    fn run_pending_open(&mut self, intent: PendingOpen) {
+        match intent {
+            PendingOpen::Dialog => self.open_dialog_now(),
+            PendingOpen::Path(path) => self.open_path_now(path),
+            PendingOpen::Recovery => self.restore_recovery_now(),
         }
     }
 
@@ -480,6 +571,13 @@ impl App {
 
     /// Take the unsaved work from the previous session.
     pub fn restore_recovery(&mut self) {
+        if self.guard_unsaved(PendingOpen::Recovery) {
+            return;
+        }
+        self.restore_recovery_now();
+    }
+
+    fn restore_recovery_now(&mut self) {
         let Some(pending) = self.pending_recovery.take() else {
             return;
         };

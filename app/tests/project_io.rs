@@ -407,3 +407,110 @@ fn a_flood_of_frame_failures_stays_bounded() {
     assert_eq!(repeated.count, 500);
     assert_eq!(repeated.label(), "proxy is unreadable (×500)");
 }
+
+// -- unsaved work is not dropped on the floor --------------------------------
+
+/// Dropping a video onto the window mid-edit used to replace the project
+/// immediately and silently. Combined with the dirty flag never being set for
+/// crop or audio work, that was unrecoverable loss in two clicks.
+#[test]
+fn opening_a_file_with_unsaved_changes_asks_first() {
+    let ctx = egui::Context::default();
+    let dir = workdir("guard-open");
+    let mut app = app_with_project(&ctx, &dir);
+
+    // An edit, through the real entry point.
+    app.set_original_gain(-6.0);
+    assert!(app.unsaved);
+    let source = app.project.as_ref().unwrap().source.path.clone();
+
+    // As if a video had been dropped on the window.
+    let other = dir.join("other.mkv");
+    std::fs::write(&other, b"another video").unwrap();
+    app.open_path(other.clone());
+
+    assert_eq!(
+        app.confirm_discard,
+        Some(clip_editor::app::PendingOpen::Path(other.clone())),
+        "the open is held, not performed"
+    );
+    assert_eq!(
+        app.project.as_ref().unwrap().source.path,
+        source,
+        "the edit is still open"
+    );
+    assert_eq!(app.project.as_ref().unwrap().original_audio.gain_db, -6.0);
+
+    // Cancelling leaves everything exactly as it was, including the question
+    // being gone.
+    app.cancel_pending_open();
+    assert_eq!(app.confirm_discard, None);
+    assert!(app.unsaved);
+    assert_eq!(app.project.as_ref().unwrap().source.path, source);
+}
+
+/// Saved work is not something to ask about — the question only exists to stop
+/// a loss, and there is nothing to lose.
+#[test]
+fn opening_a_file_with_nothing_unsaved_just_opens() {
+    let ctx = egui::Context::default();
+    let dir = workdir("guard-clean");
+    let mut app = app_with_project(&ctx, &dir);
+    assert!(!app.unsaved);
+
+    // A project file, so the open path does not need ffmpeg to probe a source.
+    let path = dir.join("other.clip");
+    let mut other = app.project.clone().unwrap();
+    other.segments = vec![Segment::from_frames(FrameIdx(0), FrameIdx(15), fps())];
+    project_file::save(&path, &other, &ViewState::default()).unwrap();
+
+    app.open_path(path.clone());
+    assert_eq!(app.confirm_discard, None, "nothing to ask about");
+    assert_eq!(app.save_path, Some(path));
+}
+
+/// Choosing to discard goes through with the open — and takes the recovery
+/// snapshot's reason to exist with it.
+#[test]
+fn discarding_unsaved_changes_completes_the_open() {
+    let ctx = egui::Context::default();
+    let dir = workdir("guard-discard");
+    let mut app = app_with_project(&ctx, &dir);
+
+    let path = dir.join("other.clip");
+    let mut other = app.project.clone().unwrap();
+    other.segments = vec![Segment::from_frames(FrameIdx(0), FrameIdx(15), fps())];
+    project_file::save(&path, &other, &ViewState::default()).unwrap();
+
+    app.set_original_gain(-6.0);
+    app.open_path(path.clone());
+    assert!(app.confirm_discard.is_some());
+
+    app.discard_and_open();
+    assert_eq!(app.confirm_discard, None);
+    assert_eq!(app.save_path, Some(path), "the held open went through");
+    assert!(!app.unsaved);
+    assert_eq!(
+        app.project.as_ref().unwrap().original_audio.gain_db,
+        0.0,
+        "the discarded edit is gone"
+    );
+}
+
+/// Restoring a recovery snapshot replaces the project too, so it asks on the
+/// same terms — the comment claiming the notice blocks everything behind it
+/// was not true of the notice, and is not the only route in.
+#[test]
+fn restoring_a_recovery_snapshot_asks_before_replacing_an_edit() {
+    let ctx = egui::Context::default();
+    let dir = workdir("guard-recovery");
+    let mut app = app_with_project(&ctx, &dir);
+
+    app.set_original_gain(-6.0);
+    app.restore_recovery();
+    assert_eq!(
+        app.confirm_discard,
+        Some(clip_editor::app::PendingOpen::Recovery)
+    );
+    assert_eq!(app.project.as_ref().unwrap().original_audio.gain_db, -6.0);
+}
