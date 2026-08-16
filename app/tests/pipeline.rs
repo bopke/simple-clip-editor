@@ -343,6 +343,61 @@ fn proxy_and_frame_extraction_round_trip() {
     }
 }
 
+/// `FrameServer::shutdown` used to cancel a token nothing decoded under, so it
+/// had no effect at all. The observable difference is here: a request that
+/// arrives after shutdown must not come back as a decoded frame.
+#[test]
+fn shutting_down_the_frame_server_stops_decoding() {
+    let Some(tools) = tools() else { return };
+    let dir = workdir("frameserver");
+    let src = make_source(&tools, &dir);
+    let info = import::probe_source(&tools, &src).expect("probe");
+    let project = Project::new(info);
+
+    let (tx, rx) = jobs::channel();
+    let frames = import::FrameServer::spawn(tools.clone(), tx);
+
+    let request = |frame: u64| import::FrameRequest {
+        generation: 0,
+        frame: FrameIdx(frame),
+        args: command::source_frame_args(
+            &project,
+            FrameIdx(frame).to_time(project.project_fps),
+            command::PROXY_HEIGHT,
+        ),
+        height: command::PROXY_HEIGHT,
+    };
+
+    // Baseline: the server does decode when it is running, so a later absence
+    // of frames means something rather than nothing.
+    frames.request(request(30));
+    assert!(
+        wait_for_frame(&rx),
+        "a running frame server should decode a frame"
+    );
+
+    frames.shutdown();
+    frames.request(request(60));
+    assert!(
+        !wait_for_frame(&rx),
+        "a frame server told to shut down must not keep decoding"
+    );
+}
+
+/// Wait briefly for a decoded frame. Decoding straight from the source needs a
+/// seek, so this cannot be instant, and a bare `try_recv` would race.
+fn wait_for_frame(rx: &jobs::Rx) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        match rx.try_recv() {
+            Ok(Msg::Frame(_)) => return true,
+            Ok(_) => {}
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(20)),
+        }
+    }
+    false
+}
+
 #[test]
 fn cancelling_an_export_leaves_no_output() {
     let Some(tools) = tools() else { return };

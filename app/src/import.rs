@@ -163,9 +163,12 @@ impl FrameServer {
     pub fn spawn(tools: Tools, out: Tx) -> FrameServer {
         let (tx, rx) = crossbeam_channel::unbounded::<FrameRequest>();
         let cancel = Cancel::new();
+        // The worker decodes under *this* token, not one of its own, which is
+        // what makes `shutdown` able to reach the ffmpeg child it has running.
+        let worker_cancel = cancel.clone();
         std::thread::Builder::new()
             .name("frame-server".into())
-            .spawn(move || frame_loop(tools, rx, out))
+            .spawn(move || frame_loop(tools, rx, out, worker_cancel))
             .expect("spawning frame server");
         FrameServer { tx, cancel }
     }
@@ -174,17 +177,31 @@ impl FrameServer {
         let _ = self.tx.send(req);
     }
 
+    /// Kill a decode in flight. Called on exit, where the thing worth stopping
+    /// is the ffmpeg child: an orphan is not reliably cleaned up by the OS on
+    /// any of the three platforms, and waiting for it to notice the closed
+    /// stdout pipe is a race, not a guarantee.
+    ///
+    /// This does not join the worker. A cancelled token cannot wake a thread
+    /// blocked in `recv()` — what ends `frame_loop` is the sender dropping
+    /// when `App` does, moments later. Killing the child is synchronous here
+    /// and is the part that matters.
     pub fn shutdown(&self) {
         self.cancel.cancel();
     }
 }
 
-fn frame_loop(tools: Tools, rx: Receiver<FrameRequest>, out: Tx) {
-    let cancel = Cancel::new();
+fn frame_loop(tools: Tools, rx: Receiver<FrameRequest>, out: Tx, cancel: Cancel) {
     while let Ok(mut req) = rx.recv() {
         // Coalesce: only the newest position matters.
         while let Ok(newer) = rx.try_recv() {
             req = newer;
+        }
+        // Once cancelled the token kills every child at spawn, so continuing
+        // would just turn each queued request into a failure message aimed at
+        // a UI that is going away.
+        if cancel.is_cancelled() {
+            break;
         }
         match tools.run_capture_stdout(&req.args, &cancel) {
             Ok(bytes) if !bytes.is_empty() => {
@@ -203,6 +220,8 @@ fn frame_loop(tools: Tools, rx: Receiver<FrameRequest>, out: Tx) {
             // A seek past the end simply produces nothing; that is not an error
             // worth putting in front of the user.
             Ok(_) => {}
+            // A cancelled decode is a shutdown, not a failure to report.
+            Err(_) if cancel.is_cancelled() => break,
             Err(e) => {
                 let _ = out.send(Msg::FrameFailed(e.to_string()));
             }
