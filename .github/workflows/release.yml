@@ -1,9 +1,23 @@
 name: Release
 
+# Gated on CI, not on the push. Tests live in their own workflow, so a release
+# triggered by `push: main` cut `build-<sha>` and wrote notes claiming it works
+# no matter what the suite said — including when the suite was red. `workflow_run`
+# is what makes "CI passed" a precondition rather than a coincidence; the
+# `conclusion` check below is the actual gate, since this event fires on failure
+# too.
+#
+# The one test the release job used to run for itself (`--lib version`) checks
+# that the window title is non-empty, and ran *after* packaging. It stays, as a
+# check that the packaged binary reports the commit — but it is no longer
+# standing in for a test suite.
 on:
-  push:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
     branches: [main]
-  # Handy for re-cutting a build without an empty commit.
+  # Handy for re-cutting a build without an empty commit. Deliberately not
+  # gated: a human asking for a specific build has already decided.
   workflow_dispatch:
 
 concurrency:
@@ -15,10 +29,17 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # `workflow_run` runs against the default branch, not against the commit that
+  # was tested — so every step that needs the release commit takes it from here
+  # rather than from `github.sha`, which would package something CI never saw.
+  RELEASE_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
 
 jobs:
   build:
     name: build (${{ matrix.os }})
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -34,6 +55,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          # The commit CI passed on, not whatever main points at now.
+          ref: ${{ env.RELEASE_SHA }}
           # build.rs reads the commit, and a shallow clone still has HEAD.
           fetch-depth: 1
 
@@ -47,9 +70,11 @@ jobs:
             libx11-dev libxrandr-dev libxi-dev libxcursor-dev \
             libwayland-dev libgl1-mesa-dev pkg-config
 
+      # The pin in `rust-toolchain.toml`, so the shipped binary is built by the
+      # compiler CI tested with.
       - name: Install Rust
         shell: bash
-        run: rustup toolchain install stable --profile minimal --no-self-update
+        run: rustup toolchain install --no-self-update
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -109,11 +134,19 @@ jobs:
           cp LICENSE README.md dist/staging/
           (cd dist/staging && 7z a -tzip "../clip-editor-${{ steps.sha.outputs.short }}-windows-x86_64.zip" . >/dev/null)
 
-      - name: Verify the build reports its commit
+      # The release notes tell the user the window title identifies their build.
+      # Asserting the exact title is what makes that claim testable: the old
+      # check only proved the title was non-empty, which a `dev` stamp or a
+      # dirty-tree `+` would also satisfy — and both mean the archive about to
+      # be published is not labelled with the commit in its own release notes.
+      - name: Verify the build reports the commit being released
         if: runner.os != 'Windows'
         shell: bash
         run: |
-          cargo test -p clip-editor --lib version -- --nocapture
+          set -euo pipefail
+          TITLE=$(cargo run --release -p clip-editor --example print_title)
+          echo "$TITLE"
+          test "$TITLE" = "Clip Editor version ${{ steps.sha.outputs.short }}"
 
       - uses: actions/upload-artifact@v4
         with:
@@ -134,6 +167,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_SHA }}
 
       - uses: actions/download-artifact@v4
         with:
@@ -200,5 +235,5 @@ jobs:
           gh release create "$TAG" \
             --title "Clip Editor $SHORT" \
             --notes-file notes.md \
-            --target "$GITHUB_SHA" \
+            --target "$RELEASE_SHA" \
             artifacts/*

@@ -1,0 +1,13 @@
+# The toolchain is pinned for the same reason ffmpeg is: a new stable ships new
+# clippy lints, and with `-D warnings` in CI that turns every open pull request
+# red on a Tuesday for reasons unrelated to any change in it. A pin makes the
+# upgrade a commit — one that can be reviewed, and that fails on its own rather
+# than on someone else's work.
+#
+# Bump deliberately: change the version here, run `cargo clippy --workspace
+# --all-targets -- -D warnings` locally, fix what the new lints found, and send
+# that as its own pull request.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

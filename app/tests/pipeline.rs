@@ -26,8 +26,9 @@ fn tools() -> Option<Tools> {
     let found = clip_editor::ffmpeg::from_env().or_else(clip_editor::ffmpeg::find_on_path);
     if found.is_none() && require_ffmpeg() {
         panic!(
-            "CLIP_REQUIRE_FFMPEG is set but no ffmpeg was found: neither $CLIP_FFMPEG \
-             nor PATH provided an ffmpeg/ffprobe pair, so this test would have skipped"
+            "CLIP_REQUIRE_FFMPEG is set but no ffmpeg was found: neither ${} nor PATH \
+             provided an ffmpeg/ffprobe pair, so this test would have skipped",
+            clip_editor::ffmpeg::ENV_OVERRIDE
         );
     }
     found
