@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# A new push supersedes the run already in flight for that branch.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev libasound2-dev libudev-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libx11-dev libxrandr-dev libxi-dev libxcursor-dev \
+            libwayland-dev libgl1-mesa-dev pkg-config
+
+      # The end-to-end tests run the real pipeline against a real ffmpeg.
+      # Without one they skip, which would quietly hollow out the suite, so
+      # every runner gets one.
+      - name: Install ffmpeg (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y ffmpeg
+
+      - name: Install ffmpeg (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+
+      - name: Install ffmpeg (Windows)
+        if: runner.os == 'Windows'
+        run: choco install ffmpeg --no-progress -y
+
+      - name: Confirm ffmpeg is present
+        shell: bash
+        run: |
+          ffmpeg -hide_banner -version | head -1
+          ffprobe -hide_banner -version | head -1
+
+      - name: Install Rust
+        shell: bash
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy --no-self-update
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --workspace --verbose
+
+      # The suite is allowed to skip the ffmpeg-backed tests when no ffmpeg
+      # exists; on CI that would be a silent hole, so assert they really ran.
+      - name: Assert the end-to-end tests were not skipped
+        shell: bash
+        run: |
+          output=$(cargo test -p clip-editor --test pipeline -- --nocapture 2>&1)
+          echo "$output"
+          echo "$output" | grep -q "6 passed" || {
+            echo "::error::pipeline tests did not all run — is ffmpeg on PATH?"
+            exit 1
+          }

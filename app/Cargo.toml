@@ -1,0 +1,35 @@
+[package]
+name = "clip-editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clip-core = { path = "../core" }
+cpal = "0.18.1"
+crossbeam-channel.workspace = true
+directories.workspace = true
+eframe = "0.36.1"
+egui = "0.36.1"
+image = "0.25.10"
+lzma-rs = "0.3.0"
+num_cpus = "1.17.0"
+rfd = "0.17.2"
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.11.0"
+tar = "0.4.46"
+ureq = "3.4.0"
+zip = "8.6.0"
+
+[lib]
+name = "clip_editor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "clip-editor"
+path = "src/main.rs"
+
+[dev-dependencies]
+serde_json.workspace = true

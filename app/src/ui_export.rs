@@ -1,0 +1,162 @@
+//! Modal overlays: the export dialog, HDR notice, and error toasts.
+
+use crate::app::App;
+use egui::{Color32, RichText};
+
+pub fn overlays(app: &mut App, ctx: &egui::Context) {
+    export_dialog(app, ctx);
+    hdr_notice(app, ctx);
+    errors(app, ctx);
+}
+
+fn export_dialog(app: &mut App, ctx: &egui::Context) {
+    if !app.show_export {
+        return;
+    }
+    let mut open = true;
+    egui::Window::new("Export")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .open(&mut open)
+        .show(ctx, |ui| {
+            let Some(project) = &app.project else {
+                ui.label("Nothing to export.");
+                return;
+            };
+            let (w, h) = project.output_size();
+            let segments = project.normalised_segments();
+            egui::Grid::new("export-summary")
+                .num_columns(2)
+                .spacing([12.0, 4.0])
+                .show(ui, |ui| {
+                    ui.label("Preset");
+                    ui.label(project.output.preset.label());
+                    ui.end_row();
+                    ui.label("Resolution");
+                    ui.label(format!("{w} × {h}"));
+                    ui.end_row();
+                    ui.label("Frame rate");
+                    ui.label(project.output_fps().to_ffmpeg_arg());
+                    ui.end_row();
+                    ui.label("Duration");
+                    ui.label(project.output_duration().to_display());
+                    ui.end_row();
+                    ui.label("Segments");
+                    ui.label(format!("{}", segments.len()));
+                    ui.end_row();
+                    ui.label("Audio tracks");
+                    ui.label(format!("{}", project.added_tracks.len()));
+                    ui.end_row();
+                    ui.label("File");
+                    ui.label(
+                        RichText::new(
+                            app.output_path
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_default(),
+                        )
+                        .monospace()
+                        .size(10.0),
+                    );
+                    ui.end_row();
+                });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if app.export_job.is_some() {
+                    ui.add(
+                        egui::ProgressBar::new(app.export_progress)
+                            .desired_width(220.0)
+                            .text(app.export_label.clone()),
+                    );
+                    if ui.button("Cancel").clicked() {
+                        app.cancel_export();
+                    }
+                } else if ui.button("Start export").clicked() {
+                    let ctx = ui.ctx().clone();
+                    app.start_export(&ctx);
+                }
+            });
+            if let Some(result) = &app.export_result {
+                match result {
+                    Ok(path) => {
+                        ui.label(
+                            RichText::new(format!("Done: {}", path.display()))
+                                .color(Color32::from_rgb(140, 220, 140))
+                                .size(11.0),
+                        );
+                    }
+                    Err(e) => {
+                        ui.label(
+                            RichText::new(e)
+                                .color(Color32::from_rgb(240, 140, 140))
+                                .size(11.0),
+                        );
+                    }
+                }
+            }
+        });
+    if !open {
+        app.show_export = false;
+    }
+    if app.export_job.is_some() {
+        ctx.request_repaint_after(std::time::Duration::from_millis(120));
+    }
+}
+
+fn hdr_notice(app: &mut App, ctx: &egui::Context) {
+    if !app.hdr_warning {
+        return;
+    }
+    let mut open = true;
+    egui::Window::new("HDR source")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.set_max_width(420.0);
+            ui.label(
+                "This recording is HDR. It will be tone-mapped to SDR (BT.709) on \
+                 import and on export, so the preview matches the output.",
+            );
+            ui.label(
+                RichText::new("Tone-mapping is not free: expect import to take longer than usual.")
+                    .size(11.0)
+                    .color(Color32::from_gray(150)),
+            );
+            if ui.button("Got it").clicked() {
+                app.hdr_warning = false;
+            }
+        });
+    if !open {
+        app.hdr_warning = false;
+    }
+}
+
+fn errors(app: &mut App, ctx: &egui::Context) {
+    if app.errors.is_empty() {
+        return;
+    }
+    let mut dismiss = false;
+    egui::Window::new("Problem")
+        .collapsible(false)
+        .resizable(false)
+        .anchor(egui::Align2::CENTER_BOTTOM, egui::Vec2::new(0.0, -24.0))
+        .show(ctx, |ui| {
+            ui.set_max_width(520.0);
+            for e in app.errors.iter().rev().take(4) {
+                ui.label(
+                    RichText::new(e)
+                        .size(11.0)
+                        .color(Color32::from_rgb(240, 160, 160)),
+                );
+            }
+            if ui.button("Dismiss").clicked() {
+                dismiss = true;
+            }
+        });
+    if dismiss {
+        app.errors.clear();
+    }
+}
