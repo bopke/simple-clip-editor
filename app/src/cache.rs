@@ -158,24 +158,6 @@ pub fn cleanup() {
     }
 }
 
-/// Total bytes currently cached, for the settings readout.
-pub fn size_on_disk() -> u64 {
-    fn walk(p: &Path) -> u64 {
-        let Ok(entries) = fs::read_dir(p) else {
-            return 0;
-        };
-        entries
-            .flatten()
-            .map(|e| match e.metadata() {
-                Ok(m) if m.is_dir() => walk(&e.path()),
-                Ok(m) => m.len(),
-                Err(_) => 0,
-            })
-            .sum()
-    }
-    cache_root().map(|r| walk(&r)).unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

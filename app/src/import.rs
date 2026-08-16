@@ -21,7 +21,9 @@ pub fn probe_source(tools: &Tools, path: &Path) -> Result<SourceInfo, String> {
     clip_core::probe::parse(&json, path).map_err(|e| e.to_string())
 }
 
-pub fn probe_duration(tools: &Tools, path: &Path) -> Option<RationalTime> {
+/// Duration only, for sources we do not otherwise inspect — an added music
+/// track needs its length but nothing else ffprobe reports.
+fn probe_duration(tools: &Tools, path: &Path) -> Option<RationalTime> {
     let json = tools.probe(&command::ffprobe_args(path)).ok()?;
     clip_core::probe::parse_duration(&json)
 }
@@ -120,10 +122,7 @@ pub fn run_import(tools: Tools, project: Project, cache: SourceCache, tx: Tx, ca
 
 /// Probe an added music track and decode it for the preview mixer.
 pub fn load_track(tools: Tools, index: usize, path: PathBuf, dest: PathBuf, tx: Tx) {
-    let duration = tools
-        .probe(&command::ffprobe_args(&path))
-        .ok()
-        .and_then(|j| clip_core::probe::parse_duration(&j));
+    let duration = probe_duration(&tools, &path);
     let cancel = Cancel::new();
     let pcm = if tools
         .run_with_progress(&command::track_pcm_args(&path, &dest), &cancel, |_| {})

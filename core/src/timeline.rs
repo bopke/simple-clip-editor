@@ -84,11 +84,6 @@ impl Timeline {
         let idx = self.starts.partition_point(|&s| s <= out.0);
         idx.checked_sub(1)
     }
-
-    /// Output frame where each segment begins — the cut points, for drawing.
-    pub fn cut_points(&self) -> &[u64] {
-        &self.starts
-    }
 }
 
 #[cfg(test)]
