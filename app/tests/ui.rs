@@ -429,3 +429,55 @@ fn the_recovery_notice_does_not_answer_to_escape() {
     assert!(app.unsaved, "and leaves the edit exactly as it was");
     assert!(app.project.is_some());
 }
+
+/// `split_at` and `keep_only` were implemented, tested and bound to nothing —
+/// `split_at`'s own doc described "how a cut point gets created before deleting
+/// one side", a workflow no user could perform. These drive them through the
+/// keyboard, which is the part that was missing.
+#[test]
+fn split_and_keep_only_are_reachable_from_the_keyboard() {
+    let ctx = egui::Context::default();
+    let mut app = test_app(&ctx);
+    project(&mut app);
+    let fps = Rational::from_int(60);
+
+    // One segment covering the whole source; split it at the playhead.
+    app.playhead = FrameIdx(120);
+    frame(&mut app, &ctx, key(egui::Key::S, egui::Modifiers::NONE));
+    let segments = &app.project.as_ref().unwrap().segments;
+    assert_eq!(segments.len(), 2, "the split made a cut point");
+    assert_eq!(segments[0].end_frame(fps), FrameIdx(120));
+    assert_eq!(segments[1].start_frame(fps), FrameIdx(120));
+    assert!(app.unsaved);
+
+    // Ctrl+S still saves rather than splitting. It needs somewhere to save to:
+    // without a path it would reach for a real file dialog, which is not a
+    // thing a headless test can answer.
+    let before = app.project.as_ref().unwrap().segments.clone();
+    let dir = std::env::temp_dir().join("clipper-ui-split");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    app.save_path = Some(dir.join("edit.clip"));
+    frame(&mut app, &ctx, key(egui::Key::S, egui::Modifiers::COMMAND));
+    assert_eq!(app.project.as_ref().unwrap().segments, before);
+    assert!(!app.unsaved, "Ctrl+S saved");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Shift+X keeps the selection and drops the rest — the inverse of X.
+    app.selection = Some((FrameIdx(60), FrameIdx(180)));
+    frame(&mut app, &ctx, key(egui::Key::X, egui::Modifiers::SHIFT));
+    let segments = &app.project.as_ref().unwrap().segments;
+    assert_eq!(
+        segments.first().map(|s| s.start_frame(fps)),
+        Some(FrameIdx(60))
+    );
+    assert_eq!(
+        segments.last().map(|s| s.end_frame(fps)),
+        Some(FrameIdx(180))
+    );
+    assert_eq!(app.selection, None, "the selection is consumed");
+
+    // And it is one undo away, like every other edit.
+    app.undo();
+    assert_eq!(app.project.as_ref().unwrap().segments, before);
+}

@@ -51,6 +51,7 @@ pub enum Control {
     OriginalGain,
     TrackGain(usize),
     TrackOffset(usize),
+    TrackTrim(usize),
     Crf,
 }
 
@@ -128,7 +129,6 @@ pub struct App {
     pub project: Option<Project>,
     pub cache: Option<SourceCache>,
     pub proxy: Option<PathBuf>,
-    pub proxy_height: u32,
     pub import_job: Option<jobs::Job>,
     pub import_progress: f32,
 
@@ -244,7 +244,6 @@ impl App {
             project: None,
             cache: None,
             proxy: None,
-            proxy_height: command::PROXY_HEIGHT,
             import_job: None,
             import_progress: 0.0,
             waveform: None,
@@ -862,6 +861,21 @@ impl App {
         });
     }
 
+    /// Where in the music file the track starts playing from.
+    ///
+    /// The model has carried this from the start — serialised, folded into
+    /// `effective_seek`, covered by golden tests — with no way to set it. Zero
+    /// is stored as `None` rather than a zero-length trim, so a project that
+    /// does not use it looks like one that does not use it.
+    pub fn set_track_trim_in(&mut self, index: usize, seconds: f32) {
+        self.edit_continuous(Control::TrackTrim(index), |p| {
+            if let Some(t) = p.added_tracks.get_mut(index) {
+                t.trim_in = (seconds > 0.0)
+                    .then(|| clip_core::RationalTime::from_seconds_f64(seconds as f64));
+            }
+        });
+    }
+
     pub fn set_track_fade_out(&mut self, index: usize, on: bool) {
         self.edit(|p| {
             if let Some(t) = p.added_tracks.get_mut(index) {
@@ -1028,7 +1042,7 @@ impl App {
         if sh == 0 {
             return (0, 0);
         }
-        let h = self.proxy_height;
+        let h = command::PROXY_HEIGHT;
         let w = clip_core::model::even_round(sw as f32 * h as f32 / sh as f32);
         (w, h)
     }
@@ -1045,7 +1059,7 @@ impl App {
         self.generation += 1;
         let t = frame.to_time(project.project_fps);
         let (args, height) = match &self.proxy {
-            Some(proxy) => (command::proxy_frame_args(proxy, t), self.proxy_height),
+            Some(proxy) => (command::proxy_frame_args(proxy, t), command::PROXY_HEIGHT),
             // Before the proxy exists, decode straight from the source. Slow
             // to seek, but it makes the app usable the moment a file opens.
             None => (

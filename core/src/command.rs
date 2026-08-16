@@ -531,7 +531,8 @@ pub fn export_segment_args(
     ]);
 
     let preset = project.output.preset;
-    if preset.has_video() || preset == OutputPreset::Gif {
+    // `has_video` is already true for Gif; the extra arm said otherwise.
+    if preset.has_video() {
         a.extend([s("-vf"), video_filter_chain(project)]);
         a.extend([s("-map"), s("0:v:0")]);
         a.extend(video_encoder_args(project, hw));

@@ -61,6 +61,21 @@ fn source_section(app: &mut App, ui: &mut egui::Ui) {
         .size(11.0)
         .color(Color32::from_gray(140)),
     );
+    // The probe has always read these and nothing has ever shown them. They
+    // are what a slow import or an odd colour cast gets blamed on, so the
+    // answer belongs where someone can see it rather than in a struct.
+    let format = [src.video_codec.as_deref(), src.container.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("  ·  ");
+    if !format.is_empty() {
+        ui.label(
+            RichText::new(format)
+                .size(11.0)
+                .color(Color32::from_gray(120)),
+        );
+    }
     if src.is_vfr() {
         ui.label(
             RichText::new("Variable frame rate — normalised on import")
@@ -225,6 +240,7 @@ enum AudioChange {
     OriginalGain(f32),
     TrackGain(usize, f32),
     TrackOffset(usize, f32),
+    TrackTrim(usize, f32),
     TrackFade(usize, bool),
 }
 
@@ -305,6 +321,24 @@ fn audio_section(app: &mut App, ui: &mut egui::Ui) {
                 {
                     change = Some(AudioChange::TrackOffset(i, offset));
                 }
+                // Where in the file to start from. The model and the export
+                // have always honoured this; nothing ever offered it.
+                let mut trim = track.trim_in.map(|t| t.as_f64() as f32).unwrap_or(0.0);
+                let longest = track
+                    .duration
+                    .map(|d| d.as_f64() as f32)
+                    .unwrap_or(120.0)
+                    .max(1.0);
+                if ui
+                    .add(
+                        egui::Slider::new(&mut trim, 0.0..=longest)
+                            .text("start at s")
+                            .fixed_decimals(2),
+                    )
+                    .changed()
+                {
+                    change = Some(AudioChange::TrackTrim(i, trim));
+                }
                 let mut fade = track.fade_out;
                 if ui.checkbox(&mut fade, "Fade out at end").changed() {
                     change = Some(AudioChange::TrackFade(i, fade));
@@ -332,6 +366,7 @@ fn apply_audio_change(app: &mut App, change: AudioChange) {
         AudioChange::OriginalGain(db) => app.set_original_gain(db),
         AudioChange::TrackGain(i, db) => app.set_track_gain(i, db),
         AudioChange::TrackOffset(i, secs) => app.set_track_offset(i, secs),
+        AudioChange::TrackTrim(i, secs) => app.set_track_trim_in(i, secs),
     }
 }
 

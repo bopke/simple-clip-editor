@@ -175,12 +175,12 @@ fn parse_output(out: ProbeOutput, path: &Path) -> Result<SourceInfo, ProbeError>
 /// Duration of an arbitrary media file, for added audio tracks.
 pub fn parse_duration(json: &str) -> Option<RationalTime> {
     let out: ProbeOutput = serde_json::from_str(json).ok()?;
+    // Container first, then whichever stream admits to a length: the format
+    // header is missing often enough on captures to need the fallback, and
+    // parsing the same JSON twice to reach it was pure habit.
     out.format
         .and_then(|f| f.duration)
-        .or_else(|| {
-            let out: ProbeOutput = serde_json::from_str(json).ok()?;
-            out.streams.into_iter().find_map(|s| s.duration)
-        })
+        .or_else(|| out.streams.into_iter().find_map(|s| s.duration))
         .and_then(|d| d.parse::<f64>().ok())
         .map(RationalTime::from_seconds_f64)
 }

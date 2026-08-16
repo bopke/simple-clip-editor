@@ -5,7 +5,7 @@
 //! frame-stepping this makes the app usable before playback exists.
 
 use anyhow::{Context, Result};
-use clip_core::command::{PCM_CHANNELS, PCM_SAMPLE_RATE};
+use clip_core::command::PCM_CHANNELS;
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
@@ -44,11 +44,6 @@ impl Waveform {
         let lo = self.min[from..to].iter().copied().fold(0.0f32, f32::min);
         let hi = self.max[from..to].iter().copied().fold(0.0f32, f32::max);
         (lo, hi)
-    }
-
-    /// Bucket index for a time in seconds.
-    pub fn bucket_at(&self, seconds: f64) -> usize {
-        ((seconds * PCM_SAMPLE_RATE as f64) / BUCKET_FRAMES as f64) as usize
     }
 
     pub fn compute(pcm_path: &Path) -> Result<Waveform> {
@@ -166,10 +161,6 @@ impl Pcm {
 
     pub fn frames(&self) -> usize {
         self.samples.len() / PCM_CHANNELS as usize
-    }
-
-    pub fn duration_secs(&self) -> f64 {
-        self.frames() as f64 / PCM_SAMPLE_RATE as f64
     }
 
     /// One stereo frame. Out-of-range reads are silence rather than a panic —

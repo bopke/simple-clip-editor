@@ -26,14 +26,6 @@ pub fn db_to_linear(db: f32) -> f32 {
     }
 }
 
-pub fn linear_to_db(linear: f32) -> f32 {
-    if linear <= 0.0 {
-        f32::NEG_INFINITY
-    } else {
-        20.0 * linear.log10()
-    }
-}
-
 pub fn is_muted(db: f32) -> bool {
     db <= MUTE_DB || db == f32::NEG_INFINITY
 }
@@ -103,11 +95,19 @@ mod tests {
         assert!((db_to_linear(-6.0) - 0.5012).abs() < 1e-3);
     }
 
+    /// The dB the sliders speak in, against the linear gain the mixer and the
+    /// `volume=` filter use. Checked against known values rather than against
+    /// an inverse function that existed only for this test.
     #[test]
-    fn roundtrip() {
-        for db in [-40.0f32, -12.0, -3.0, 0.0, 3.5, 12.0] {
-            let back = linear_to_db(db_to_linear(db));
-            assert!((back - db).abs() < 1e-3, "{db} -> {back}");
+    fn known_gains() {
+        for (db, linear) in [
+            (0.0f32, 1.0f32),
+            (-6.0, 0.5012),
+            (6.0, 1.9953),
+            (-20.0, 0.1),
+        ] {
+            let got = db_to_linear(db);
+            assert!((got - linear).abs() < 1e-3, "{db} dB -> {got}");
         }
     }
 

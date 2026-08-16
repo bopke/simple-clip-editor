@@ -71,6 +71,22 @@ const EDIT_PATHS: &[EditPath] = &[
         },
     },
     EditPath {
+        name: "keys::split",
+        setup: nothing,
+        apply: |app| {
+            app.playhead = FrameIdx(45);
+            keys::split(app);
+        },
+    },
+    EditPath {
+        name: "keys::keep_only",
+        setup: nothing,
+        apply: |app| {
+            app.selection = Some((FrameIdx(30), FrameIdx(60)));
+            keys::keep_only(app);
+        },
+    },
+    EditPath {
         name: "keys::delete_range",
         setup: nothing,
         apply: |app| {
@@ -126,6 +142,11 @@ const EDIT_PATHS: &[EditPath] = &[
         name: "set_track_offset",
         setup: with_track,
         apply: |app| app.set_track_offset(0, 2.5),
+    },
+    EditPath {
+        name: "set_track_trim_in",
+        setup: with_track,
+        apply: |app| app.set_track_trim_in(0, 12.0),
     },
     EditPath {
         name: "set_track_fade_out",
@@ -324,6 +345,47 @@ fn a_rejected_removal_pushes_nothing() {
     assert!(!app.unsaved, "a rejected edit is not an edit");
 }
 
+/// Splitting where there is nothing to split — on a segment's own edge, or
+/// outside every segment — is not an edit. `edits::split_at` checks the same
+/// thing and simply returns; it cannot report that it did nothing, so the
+/// caller checks before starting an undo entry it would have to fill with the
+/// state it began with.
+#[test]
+fn a_split_that_lands_on_nothing_pushes_nothing() {
+    let ctx = egui::Context::default();
+    let mut app = app_with_project(&ctx, &workdir());
+
+    // Frame 0 is the segment's own start.
+    app.playhead = FrameIdx(0);
+    keys::split(&mut app);
+    assert_eq!(app.undo.depth(), 0);
+    assert!(!app.unsaved);
+
+    // Well past the end of a 60-second source at 30 fps.
+    app.playhead = FrameIdx(99_999);
+    keys::split(&mut app);
+    assert_eq!(app.undo.depth(), 0);
+    assert!(!app.unsaved);
+}
+
+/// `Shift+X` with no selection has no range to keep, and guessing one would
+/// delete most of the timeline on a stray keystroke.
+#[test]
+fn keep_only_without_a_selection_does_nothing() {
+    let ctx = egui::Context::default();
+    let mut app = app_with_project(&ctx, &workdir());
+
+    app.selection = None;
+    keys::keep_only(&mut app);
+    assert_eq!(app.undo.depth(), 0);
+    assert!(!app.unsaved);
+
+    // An empty selection is not a range either.
+    app.selection = Some((FrameIdx(30), FrameIdx(30)));
+    keys::keep_only(&mut app);
+    assert_eq!(app.undo.depth(), 0);
+}
+
 /// Setting the fps to the value it already has is not an edit either.
 #[test]
 fn a_no_op_fps_change_pushes_nothing() {
@@ -343,7 +405,7 @@ fn a_no_op_fps_change_pushes_nothing() {
 fn all_mutating_paths_are_listed() {
     assert_eq!(
         EDIT_PATHS.len(),
-        15,
+        18,
         "a mutating edit path was added or removed — update EDIT_PATHS to match"
     );
 }

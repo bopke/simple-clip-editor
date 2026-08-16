@@ -14,7 +14,9 @@ pub const HELP: &[(&str, &str)] = &[
     ("← / →", "Step one frame"),
     ("Shift + ← / →", "Step one second"),
     ("I / O", "Set in / out point at playhead"),
+    ("S", "Split at playhead"),
     ("X", "Delete range under playhead"),
+    ("Shift + X", "Keep only the selection"),
     ("Home / End", "Start / end of timeline"),
     ("C", "Toggle crop tool"),
     ("Ctrl+Z / Ctrl+Shift+Z", "Undo / redo"),
@@ -120,6 +122,8 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
             }
             Key::I => set_in(app),
             Key::O => set_out(app),
+            Key::S => split(app),
+            Key::X if mods.shift => keep_only(app),
             Key::X => delete_range(app),
             Key::C => app.crop_tool = !app.crop_tool,
             _ => {}
@@ -187,6 +191,41 @@ pub fn set_out(app: &mut App) {
     // would start.
     let end = app.playhead.saturating_add(1).to_time(app.fps());
     app.edit(|p| edits::set_out(&mut p.segments, end));
+}
+
+/// `S` cuts the segment under the playhead in two, keeping both halves.
+///
+/// [`edits::split_at`] has been implemented and tested since the beginning and
+/// bound to nothing, which made its own doc comment — "this is how a cut point
+/// gets created before deleting one side" — describe a workflow no user could
+/// perform.
+pub fn split(app: &mut App) {
+    let at = app.playhead.to_time(app.fps());
+    // Splitting at a segment's own edge, or outside every segment, does
+    // nothing — and a no-op must not consume an undo step or mark the project
+    // unsaved. `split_at` checks the same condition; it just cannot report it.
+    let splits = app.project.as_ref().is_some_and(|p| {
+        edits::segment_at(&p.segments, at)
+            .is_some_and(|i| at > p.segments[i].start && at < p.segments[i].end)
+    });
+    if !splits {
+        return;
+    }
+    app.edit(|p| edits::split_at(&mut p.segments, at));
+}
+
+/// `Shift+X` throws away everything except the selection — the inverse of `X`.
+///
+/// Needs a selection: with no range there is nothing to keep, and guessing one
+/// would mean deleting most of the timeline on a stray keystroke.
+pub fn keep_only(app: &mut App) {
+    let fps = app.fps();
+    let Some((a, b)) = app.selection.filter(|(a, b)| b.0 > a.0) else {
+        return;
+    };
+    let (from, to) = (a.to_time(fps), b.to_time(fps));
+    app.edit(|p| edits::keep_only(&mut p.segments, from, to));
+    app.selection = None;
 }
 
 /// With a selection, `X` removes exactly that range. Without one, it removes
