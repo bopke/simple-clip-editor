@@ -23,6 +23,15 @@ tar = "0.4.46"
 ureq = "3.4.0"
 zip = "8.6.0"
 
+# Free space on a volume has no std API, so it is one syscall per platform.
+# Both of these are already in the tree via eframe and cpal, so declaring them
+# adds no crate to the dependency graph — only a direct name for what is there.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
+
 [lib]
 name = "clip_editor"
 path = "src/lib.rs"

@@ -98,6 +98,9 @@ pub struct App {
     pub export_result: Option<Result<PathBuf, String>>,
     pub show_export: bool,
     pub output_path: Option<PathBuf>,
+    /// Raised when an export is about to overwrite something or run out of
+    /// room. `Some` means the user has been asked and has not answered yet.
+    pub export_confirm: Option<export::Preflight>,
 
     pub undo: UndoStack,
     pub status: String,
@@ -189,6 +192,7 @@ impl App {
             export_result: None,
             show_export: false,
             output_path: None,
+            export_confirm: None,
             undo: UndoStack::default(),
             status: String::new(),
             errors: ErrorLog::default(),
@@ -756,7 +760,33 @@ impl App {
 
     // -- export --------------------------------------------------------
 
+    /// Start an export, or raise what the user should see first.
+    ///
+    /// Replacing a file and running out of disk twenty minutes in are both
+    /// things they would want to have been told, and neither was ever said —
+    /// the default output path never passes through a save dialog, so nothing
+    /// asked. When [`export::preflight`] finds something, this stops and puts
+    /// it on screen; the answer comes back through
+    /// [`start_export_confirmed`](Self::start_export_confirmed).
     pub fn start_export(&mut self, ctx: &egui::Context) {
+        let Some(project) = self.project.as_ref() else {
+            return;
+        };
+        let Some(out) = self.output_path.clone() else {
+            return;
+        };
+        let scratch = crate::cache::cache_root().ok();
+        let checks = export::preflight(project, &out, scratch.as_deref());
+        if checks.is_clear() {
+            self.start_export_confirmed(ctx);
+        } else {
+            self.export_confirm = Some(checks);
+        }
+    }
+
+    /// Start the export the user has been warned about and asked for anyway.
+    pub fn start_export_confirmed(&mut self, ctx: &egui::Context) {
+        self.export_confirm = None;
         let (Some(tools), Some(project)) = (self.tools.clone(), self.project.clone()) else {
             return;
         };
@@ -784,6 +814,41 @@ impl App {
                 ctx.request_repaint();
             })
             .expect("spawning export worker");
+    }
+
+    /// Ask for the output file. Returns whether it moved — the export
+    /// confirmation uses that to decide whether anything has changed since it
+    /// asked, so a cancelled dialog does not put the same warning straight back
+    /// on screen.
+    pub fn pick_output(&mut self) -> bool {
+        let Some(project) = &self.project else {
+            return false;
+        };
+        let ext = project.output.preset.extension();
+        let start = self
+            .output_path
+            .clone()
+            .unwrap_or_else(|| export::suggested_output(project));
+        let dialog = rfd::FileDialog::new()
+            .add_filter(ext, &[ext])
+            .set_file_name(
+                start
+                    .file_name()
+                    .map(|f| f.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+            );
+        let dialog = match start.parent() {
+            Some(dir) => dialog.set_directory(dir),
+            None => dialog,
+        };
+        match dialog.save_file() {
+            Some(path) => {
+                let moved = self.output_path.as_ref() != Some(&path);
+                self.output_path = Some(path);
+                moved
+            }
+            None => false,
+        }
     }
 
     pub fn cancel_export(&mut self) {

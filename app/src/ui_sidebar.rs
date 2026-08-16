@@ -404,7 +404,7 @@ fn output_section(app: &mut App, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.label(RichText::new(path_text).size(11.0).monospace());
         if ui.small_button("…").clicked() {
-            pick_output(app);
+            app.pick_output();
         }
     });
 
@@ -447,30 +447,6 @@ fn output_section(app: &mut App, ui: &mut egui::Ui) {
             );
         }
         None => {}
-    }
-}
-
-fn pick_output(app: &mut App) {
-    let Some(project) = &app.project else { return };
-    let ext = project.output.preset.extension();
-    let start = app
-        .output_path
-        .clone()
-        .unwrap_or_else(|| crate::export::suggested_output(project));
-    let dialog = rfd::FileDialog::new()
-        .add_filter(ext, &[ext])
-        .set_file_name(
-            start
-                .file_name()
-                .map(|f| f.to_string_lossy().to_string())
-                .unwrap_or_default(),
-        );
-    let dialog = match start.parent() {
-        Some(dir) => dialog.set_directory(dir),
-        None => dialog,
-    };
-    if let Some(path) = dialog.save_file() {
-        app.output_path = Some(path);
     }
 }
 

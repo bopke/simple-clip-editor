@@ -305,3 +305,43 @@ fn dragging_inside_the_crop_rect_moves_it() {
     // Clamping to the frame edges is covered by crop::translate's own tests;
     // dragging the pointer off-screen here would only test the harness.
 }
+
+/// Export used to write over whatever was at the output path without a word.
+/// The default path is `<source>_edit.mp4` next to the source and never passes
+/// through a save dialog, so nothing in the app ever asked — a second export
+/// after changing one setting replaced the first, silently.
+#[test]
+fn exporting_over_an_existing_file_asks_first() {
+    let ctx = egui::Context::default();
+    let mut app = test_app(&ctx);
+    project(&mut app);
+
+    let dir = std::env::temp_dir().join("clipper-ui-overwrite");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("clip_edit.mp4");
+
+    // A path with nothing at it goes straight through.
+    app.output_path = Some(out.clone());
+    app.start_export(&ctx);
+    assert!(
+        app.export_confirm.is_none(),
+        "a free path must not raise a dialog"
+    );
+
+    // The same path with a file at it stops and asks, and starts nothing.
+    std::fs::write(&out, b"an earlier export").unwrap();
+    app.start_export(&ctx);
+    let confirm = app.export_confirm.as_ref().expect("the user is asked");
+    assert_eq!(confirm.overwrite, Some(17));
+    assert!(
+        app.export_job.is_none(),
+        "nothing runs until it is answered"
+    );
+
+    // The whole UI still paints with the question up.
+    frame(&mut app, &ctx, vec![]);
+    assert!(app.export_confirm.is_some());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

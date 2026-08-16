@@ -806,6 +806,7 @@ dependencies = [
  "eframe",
  "egui",
  "image",
+ "libc",
  "lzma-rs",
  "num_cpus",
  "rfd",
@@ -814,6 +815,7 @@ dependencies = [
  "sha2",
  "tar",
  "ureq",
+ "windows-sys 0.61.2",
  "zip",
 ]
 
