@@ -63,10 +63,13 @@ codesign --verify --verbose=1 "$APP"
 
 # Distribute zipped: a bare .app loses its permissions bits over most
 # transports. The GPL text ships with it, which is a licence obligation rather
-# than a nicety.
-cp LICENSE docs/ffmpeg-license.md target/ 2>/dev/null || true
+# than a nicety. No separate ffmpeg licence file: ffmpeg is not in this archive
+# (the app downloads it on first run), and the source link for the build it
+# fetches is published in the release notes. Keep this in step with the
+# packaging steps in .github/workflows/release.yml.
+cp LICENSE target/
 (cd target && rm -f "${NAME}.zip" \
-  && zip -qry "${NAME}.zip" "${NAME}.app" LICENSE ffmpeg-license.md)
+  && zip -qry "${NAME}.zip" "${NAME}.app" LICENSE)
 
 echo "built $APP"
 echo "      target/${NAME}.zip"

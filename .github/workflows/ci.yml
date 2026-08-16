@@ -79,17 +79,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Tests
-        run: cargo test --workspace --verbose
-
       # The suite is allowed to skip the ffmpeg-backed tests when no ffmpeg
-      # exists; on CI that would be a silent hole, so assert they really ran.
-      - name: Assert the end-to-end tests were not skipped
-        shell: bash
-        run: |
-          output=$(cargo test -p clip-editor --test pipeline -- --nocapture 2>&1)
-          echo "$output"
-          echo "$output" | grep -q "6 passed" || {
-            echo "::error::pipeline tests did not all run — is ffmpeg on PATH?"
-            exit 1
-          }
+      # exists; on CI that would be a silent hole. CLIP_REQUIRE_FFMPEG turns
+      # each would-be skip into a failure inside the test itself, so the suite
+      # only needs to run once and adding a pipeline test needs no change here.
+      - name: Tests
+        env:
+          CLIP_REQUIRE_FFMPEG: 1
+        run: cargo test --workspace --verbose

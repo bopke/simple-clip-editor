@@ -79,7 +79,6 @@ jobs:
           mkdir -p dist/staging
           cp -R "target/Clip Editor.app" dist/staging/
           cp LICENSE README.md dist/staging/
-          cp docs/ffmpeg-license.md dist/staging/
           (cd dist/staging && zip -qry "../clip-editor-${{ steps.sha.outputs.short }}-macos-arm64.zip" .)
 
       # -- Linux ---------------------------------------------------------
@@ -94,7 +93,6 @@ jobs:
           mkdir -p dist/staging
           cp target/release/clip-editor dist/staging/
           cp LICENSE README.md dist/staging/
-          cp docs/ffmpeg-license.md dist/staging/
           tar -C dist/staging -czf "dist/clip-editor-${{ steps.sha.outputs.short }}-linux-x86_64.tar.gz" .
 
       # -- Windows -------------------------------------------------------
@@ -109,7 +107,6 @@ jobs:
           mkdir -p dist/staging
           cp target/release/clip-editor.exe dist/staging/
           cp LICENSE README.md dist/staging/
-          cp docs/ffmpeg-license.md dist/staging/
           (cd dist/staging && 7z a -tzip "../clip-editor-${{ steps.sha.outputs.short }}-windows-x86_64.zip" . >/dev/null)
 
       - name: Verify the build reports its commit
@@ -154,8 +151,11 @@ jobs:
 
           ls -la artifacts
 
-          # Every distributed archive carries the GPL text; the ffmpeg source
-          # link is a licence obligation and belongs in the notes.
+          # Every distributed archive carries the GPL text (LICENSE). ffmpeg
+          # itself is not distributed here — it is downloaded on first run — so
+          # the archives carry no separate ffmpeg licence file; the source link
+          # for the build the app fetches is a licence obligation and lives in
+          # these notes.
           cat > notes.md <<EOF
           Automatic build of \`$SHORT\` on \`main\`.
 

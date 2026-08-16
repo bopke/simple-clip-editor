@@ -3,7 +3,8 @@
 //! but that ffmpeg rejects, or that silently produce the wrong thing.
 //!
 //! Skipped (not failed) when no ffmpeg is available, so a checkout without one
-//! still has a green test suite.
+//! still has a green test suite. Set `CLIP_REQUIRE_FFMPEG=1` to make that skip
+//! a hard failure instead — CI does, so the suite cannot silently hollow out.
 
 use clip_core::{
     command, AudioSourceSelection, AudioTrack, CropRect, FrameIdx, OutputPreset, Project, Rational,
@@ -16,8 +17,25 @@ use clip_editor::jobs::{self, Msg};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// The invariant CI cares about: *on a machine that is supposed to have
+/// ffmpeg, none of these tests may skip*. A developer checkout without ffmpeg
+/// still skips and stays green; setting `CLIP_REQUIRE_FFMPEG=1` (CI does) turns
+/// the skip into a loud failure at the point of the skip, so the check doesn't
+/// depend on counting tests or parsing test output.
 fn tools() -> Option<Tools> {
-    clip_editor::ffmpeg::from_env().or_else(clip_editor::ffmpeg::find_on_path)
+    let found = clip_editor::ffmpeg::from_env().or_else(clip_editor::ffmpeg::find_on_path);
+    if found.is_none() && require_ffmpeg() {
+        panic!(
+            "CLIP_REQUIRE_FFMPEG is set but no ffmpeg was found: neither $CLIP_FFMPEG \
+             nor PATH provided an ffmpeg/ffprobe pair, so this test would have skipped"
+        );
+    }
+    found
+}
+
+fn require_ffmpeg() -> bool {
+    // An empty value counts as unset, so `CLIP_REQUIRE_FFMPEG=` disables it.
+    std::env::var("CLIP_REQUIRE_FFMPEG").is_ok_and(|v| !v.is_empty())
 }
 
 fn workdir(name: &str) -> PathBuf {
