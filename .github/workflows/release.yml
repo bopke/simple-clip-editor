@@ -53,7 +53,7 @@ jobs:
             artifact: windows-x86_64
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # The commit CI passed on, not whatever main points at now.
           ref: ${{ env.RELEASE_SHA }}
@@ -77,7 +77,7 @@ jobs:
         run: rustup toolchain install --no-self-update
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -148,13 +148,13 @@ jobs:
           echo "$TITLE"
           test "$TITLE" = "Clip Editor version ${{ steps.sha.outputs.short }}"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.artifact }}
           path: dist/*.zip
           if-no-files-found: ignore
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: runner.os == 'Linux'
         with:
           name: ${{ matrix.artifact }}-tar
@@ -166,11 +166,11 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ env.RELEASE_SHA }}
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
           merge-multiple: true
