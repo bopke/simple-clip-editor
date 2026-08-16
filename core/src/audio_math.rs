@@ -9,6 +9,15 @@ pub const MUTE_DB: f32 = -60.0;
 /// `amix normalize=0` lets the sum clip, so this is not optional.
 pub const LIMITER_CEILING: f32 = 0.95;
 
+/// How long an added track's fade-out lasts.
+///
+/// Seconds, not samples: `command` renders this straight into an `afade`
+/// argument, and the preview mixer converts once against `PCM_SAMPLE_RATE`.
+/// Exposing both units from here would put the conversion in the crate that
+/// has no business knowing the mixer's sample rate, and the mixer already owns
+/// a `secs_to_samples` for exactly this.
+pub const FADE_OUT_SECS: f64 = 2.0;
+
 pub fn db_to_linear(db: f32) -> f32 {
     if db <= MUTE_DB || db == f32::NEG_INFINITY {
         0.0

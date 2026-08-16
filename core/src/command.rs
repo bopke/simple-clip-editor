@@ -4,7 +4,7 @@
 //! be asserted against in tests without spawning anything. The golden tests at
 //! the bottom of this file are the contract for the export pipeline.
 
-use crate::audio_math::{self, LIMITER_CEILING};
+use crate::audio_math::{self, FADE_OUT_SECS, LIMITER_CEILING};
 use crate::model::{even, AspectMode, AudioSourceSelection, OutputPreset, Project, Segment};
 use crate::time::{Rational, RationalTime};
 use std::path::Path;
@@ -647,8 +647,8 @@ fn build_audio_filter(project: &Project) -> Option<AudioFilter> {
         }
         chain.push(format!("volume={}", audio_math::linear_arg(track.gain_db)));
         if track.fade_out {
-            let st = (out_dur - FADE_SECS).max(0.0);
-            chain.push(format!("afade=t=out:st={st:.3}:d={FADE_SECS:.1}"));
+            let st = (out_dur - FADE_OUT_SECS).max(0.0);
+            chain.push(format!("afade=t=out:st={st:.3}:d={FADE_OUT_SECS:.1}"));
         }
         parts.push(format!("[{input}:a]{}{label}", chain.join(",")));
         labels.push(label);
@@ -683,8 +683,6 @@ fn build_audio_filter(project: &Project) -> Option<AudioFilter> {
         out_label: s("[aout]"),
     })
 }
-
-const FADE_SECS: f64 = 2.0;
 
 /// GIF needs a two-pass palette or it looks like 1998.
 fn gif_filter(project: &Project) -> String {
@@ -930,6 +928,53 @@ mod tests {
              -map 0:v -c:v copy -map [aout] -c:a aac -b:a 192k -movflags +faststart \
              -t 10.0 -progress pipe:1 -nostats /o/out.mp4"
         );
+    }
+
+    /// The fade-out had no coverage on this side at all, which is how the same
+    /// length came to be written down separately here and in the preview mixer.
+    /// `st` is the fade's start, so it must be `FADE_OUT_SECS` before the end of
+    /// the output — a 10 s output fading for 2 s starts at 8.
+    #[test]
+    fn fade_out_ends_with_the_output_and_lasts_the_shared_length() {
+        let mut p = project();
+        p.segments = vec![Segment {
+            start: FrameIdx(0),
+            end: FrameIdx(600),
+        }];
+        let mut t = AudioTrack::new(PathBuf::from("/m/one.mp3"));
+        t.fade_out = true;
+        p.added_tracks = vec![t];
+
+        let a = joined(&export_final_args(
+            &p,
+            Path::new("/t/l.txt"),
+            Path::new("/o/o.mp4"),
+        ));
+        assert!(a.contains("afade=t=out:st=8.000:d=2.0"), "{a}");
+        // And the output really is 10 s, so `st` above is not coincidentally
+        // right for the wrong reason.
+        assert!(a.contains("-t 10.0"), "{a}");
+    }
+
+    /// A clip shorter than the fade must not produce a negative start time —
+    /// ffmpeg rejects it and the whole export fails.
+    #[test]
+    fn fade_out_on_a_clip_shorter_than_the_fade_starts_at_zero() {
+        let mut p = project();
+        p.segments = vec![Segment {
+            start: FrameIdx(0),
+            end: FrameIdx(30),
+        }];
+        let mut t = AudioTrack::new(PathBuf::from("/m/one.mp3"));
+        t.fade_out = true;
+        p.added_tracks = vec![t];
+
+        let a = joined(&export_final_args(
+            &p,
+            Path::new("/t/l.txt"),
+            Path::new("/o/o.mp4"),
+        ));
+        assert!(a.contains("afade=t=out:st=0.000:d=2.0"), "{a}");
     }
 
     #[test]

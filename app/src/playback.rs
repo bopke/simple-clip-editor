@@ -117,7 +117,9 @@ impl MixState {
             }
             let mut g = audio_math::db_to_linear(t.gain_db);
             if t.fade_out && self.total_samples > 0 {
-                let fade = 2 * PCM_SAMPLE_RATE as u64;
+                // Same number export uses; converted here because samples are
+                // the mixer's unit, not core's.
+                let fade = secs_to_samples(audio_math::FADE_OUT_SECS).max(1) as u64;
                 let start = self.total_samples.saturating_sub(fade);
                 if n >= start {
                     let f = 1.0 - (n - start) as f32 / fade as f32;
@@ -387,6 +389,21 @@ impl Drop for VideoStream {
 mod tests {
     use super::*;
     use clip_core::{Segment, SourceInfo};
+
+    /// Export and preview now read one constant, so they cannot hold different
+    /// numbers — a test asserting they are equal would be tautological. What is
+    /// still able to drift is the unit conversion between them, so that is what
+    /// this pins: the seconds the filter string carries, and the samples the
+    /// mixer ramps over. Same trick as `audio_math::linear_arg_is_stable`.
+    #[test]
+    fn the_fade_is_the_same_length_in_both_units() {
+        assert_eq!(format!("{:.1}", audio_math::FADE_OUT_SECS), "2.0");
+        assert_eq!(
+            secs_to_samples(audio_math::FADE_OUT_SECS),
+            96_000,
+            "2 s at 48 kHz"
+        );
+    }
 
     fn tone(len: usize, value: f32) -> Arc<Pcm> {
         Arc::new(Pcm {
