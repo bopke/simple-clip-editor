@@ -687,14 +687,35 @@ pub fn scale_to_long_edge(w: u32, h: u32, long: u32) -> (u32, u32) {
     }
 }
 
-/// The smallest box of ratio `r` that contains `size` — what `pad` targets.
+/// The box of ratio `r` to letterbox `size` into.
+///
+/// Its long edge is the source's long edge. That is the framing someone asking
+/// for 9:16 means: 1920×1080 becomes **1080×1920**, the picture scaled to fit
+/// the width with bars above and below.
+///
+/// It used to return the smallest box *containing* the source, which for the
+/// same request was 1920×3412 — arithmetically the right answer to a different
+/// question, and a 6.5-megapixel frame carrying 1080 useful lines. Nobody wants
+/// a 3412-line vertical video. The unit test asserted it as correct, which is
+/// how it survived.
+///
+/// The result is a frame size, not a scale factor: the filter chain fits the
+/// source inside it with `force_original_aspect_ratio=decrease` and pads the
+/// rest, so the picture is never stretched and never cropped.
 pub fn pad_box((w, h): (u32, u32), r: Rational) -> (u32, u32) {
     let target = r.as_f64();
-    let cur = w as f64 / h.max(1) as f64;
-    if cur < target {
-        (even((h as f64 * target).round() as u32), even(h))
+    let long = w.max(h) as f64;
+    if target >= 1.0 {
+        // Landscape or square target: the long edge is the width.
+        (
+            even(long.round() as u32),
+            even((long / target).round() as u32),
+        )
     } else {
-        (even(w), even((w as f64 / target).round() as u32))
+        (
+            even((long * target).round() as u32),
+            even(long.round() as u32),
+        )
     }
 }
 
@@ -790,12 +811,49 @@ mod tests {
         assert_eq!(p.output_size(), (1080, 1920));
     }
 
+    /// What someone asking for 9:16 means: a 1080×1920 vertical video with the
+    /// landscape picture letterboxed into it. The old answer — the smallest
+    /// box *containing* the source, 1920×3412 — was arithmetically right and
+    /// practically useless, and this test asserted it.
     #[test]
-    fn pad_mode_targets_the_ratio_box() {
+    fn pad_mode_keeps_the_long_edge_and_letterboxes_into_the_ratio() {
         let mut p = Project::new(source());
         p.aspect_mode = AspectMode::PadToRatio(Rational::new(9, 16));
-        // 1920x1080 padded to 9:16 grows vertically.
-        assert_eq!(p.output_size(), (1920, 3412));
+        assert_eq!(p.output_size(), (1080, 1920));
+
+        // A landscape target on a landscape source changes nothing.
+        p.aspect_mode = AspectMode::PadToRatio(Rational::new(16, 9));
+        assert_eq!(p.output_size(), (1920, 1080));
+
+        // Square: the long edge wins and the picture gets bars.
+        p.aspect_mode = AspectMode::PadToRatio(Rational::new(1, 1));
+        assert_eq!(p.output_size(), (1920, 1920));
+
+        // The long edge is the source's, whichever way round it is: a portrait
+        // capture padded to 16:9 is a 1920-wide landscape frame.
+        let mut portrait = source();
+        portrait.width = 1080;
+        portrait.height = 1920;
+        let mut p = Project::new(portrait);
+        p.aspect_mode = AspectMode::PadToRatio(Rational::new(16, 9));
+        assert_eq!(p.output_size(), (1920, 1080));
+    }
+
+    /// The pad box is a frame size the source is fitted into, so it never
+    /// exceeds what the source can fill in its long dimension — which is what
+    /// stops the output being mostly upscaled pixels.
+    #[test]
+    fn a_pad_box_never_outgrows_the_source() {
+        for (w, h) in [(1920u32, 1080u32), (1080, 1920), (640, 480), (1000, 1000)] {
+            for (_, ratio) in ASPECT_PRESETS {
+                let (bw, bh) = pad_box((w, h), *ratio);
+                let long = w.max(h);
+                assert!(
+                    bw.max(bh) <= long + 1,
+                    "{w}x{h} at {ratio:?} gave {bw}x{bh}"
+                );
+            }
+        }
     }
 
     #[test]

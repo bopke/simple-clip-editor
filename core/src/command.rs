@@ -374,18 +374,89 @@ fn pix_fmt(preset: OutputPreset) -> &'static str {
     }
 }
 
-/// Colour metadata passed explicitly, or levels come out crushed or washed
-/// out depending on the source.
-fn color_args() -> Vec<String> {
+/// Tags this build is willing to write, and the ffprobe spellings that map to
+/// them.
+///
+/// A whitelist rather than a pass-through: these strings go straight into
+/// ffmpeg arguments, and one it does not recognise fails the export outright.
+/// Anything not here falls back to bt709, which is what every source got
+/// before and is right for the overwhelming majority of screen captures.
+///
+/// The pairs are `(what ffprobe reports, what ffmpeg is told)`. Mostly they
+/// agree; where they do not it is because the same colour space has several
+/// names and ffprobe picks a different one from the muxer.
+const COLOR_SPACES: &[(&str, &str)] = &[
+    ("bt709", "bt709"),
+    ("bt470bg", "bt470bg"),     // PAL / bt601 625-line
+    ("smpte170m", "smpte170m"), // NTSC / bt601 525-line
+    ("bt2020nc", "bt2020ncl"),  // ffprobe says nc, ffmpeg wants ncl
+    ("bt2020_ncl", "bt2020ncl"),
+];
+
+const COLOR_PRIMARIES: &[(&str, &str)] = &[
+    ("bt709", "bt709"),
+    ("bt470bg", "bt470bg"),
+    ("smpte170m", "smpte170m"),
+    ("bt2020", "bt2020"),
+];
+
+const COLOR_TRANSFERS: &[(&str, &str)] = &[
+    ("bt709", "bt709"),
+    ("smpte170m", "smpte170m"),
+    ("bt470bg", "bt470bg"),
+    ("iec61966-2-1", "iec61966-2-1"), // sRGB
+];
+
+fn mapped(table: &[(&str, &str)], value: Option<&String>) -> Option<String> {
+    let value = value?.to_ascii_lowercase();
+    table
+        .iter()
+        .find(|(probed, _)| *probed == value)
+        .map(|(_, arg)| (*arg).to_string())
+}
+
+/// Colour metadata passed explicitly, or levels come out crushed or washed out
+/// depending on the source.
+///
+/// Carried over from the source rather than hardcoded. Everything used to be
+/// tagged bt709 no matter what came in, so an SD capture — bt601, which is
+/// what `smpte170m` and `bt470bg` are — was exported with a label saying it was
+/// something else, and players obligingly rendered the wrong colours. The
+/// probe has read these fields all along; nothing read them back.
+///
+/// Two things are deliberately still fixed:
+///
+/// - **HDR sources are bt709 on the way out**, because the filter chain has
+///   just tone-mapped them to SDR. Tagging them with what arrived would
+///   describe the input, not the file being written.
+/// - **Unknown or missing values fall back to bt709**, which is both the old
+///   behaviour and the right guess for a screen capture.
+fn color_args(project: &Project) -> Vec<String> {
+    let src = &project.source;
+    let (space, primaries, transfer) = if src.is_hdr {
+        (None, None, None)
+    } else {
+        (
+            mapped(COLOR_SPACES, src.colorspace.as_ref()),
+            mapped(COLOR_PRIMARIES, src.color_primaries.as_ref()),
+            mapped(COLOR_TRANSFERS, src.color_transfer.as_ref()),
+        )
+    };
+    // `pc` only when the source says so: guessing full range on a limited-range
+    // source is exactly the crushed-blacks failure this function exists for.
+    let range = match src.color_range.as_deref().map(|r| r.to_ascii_lowercase()) {
+        Some(r) if r == "pc" || r == "full" => "pc",
+        _ => "tv",
+    };
     vec![
         s("-color_range"),
-        s("tv"),
+        s(range),
         s("-colorspace"),
-        s("bt709"),
+        space.unwrap_or_else(|| s("bt709")),
         s("-color_primaries"),
-        s("bt709"),
+        primaries.unwrap_or_else(|| s("bt709")),
         s("-color_trc"),
-        s("bt709"),
+        transfer.unwrap_or_else(|| s("bt709")),
     ]
 }
 
@@ -464,7 +535,7 @@ pub fn export_segment_args(
         a.extend([s("-vf"), video_filter_chain(project)]);
         a.extend([s("-map"), s("0:v:0")]);
         a.extend(video_encoder_args(project, hw));
-        a.extend(color_args());
+        a.extend(color_args(project));
     } else {
         a.push(s("-vn"));
     }
@@ -742,6 +813,61 @@ mod tests {
         v.join(" ")
     }
 
+    /// An SD capture is bt601, and every export used to tell the player it was
+    /// bt709 — which is a real, visible colour shift, and the probe had read
+    /// the right answer all along without anyone looking at it.
+    #[test]
+    fn colour_tags_follow_the_source_instead_of_always_saying_bt709() {
+        let mut p = project();
+        p.source.colorspace = Some("smpte170m".into());
+        p.source.color_primaries = Some("smpte170m".into());
+        p.source.color_transfer = Some("smpte170m".into());
+        p.source.color_range = Some("tv".into());
+        let a = joined(&color_args(&p));
+        assert_eq!(
+            a,
+            "-color_range tv -colorspace smpte170m \
+             -color_primaries smpte170m -color_trc smpte170m"
+        );
+
+        // Full-range only when the source says so: guessing `pc` on a
+        // limited-range source is the crushed-blacks failure this exists for.
+        p.source.color_range = Some("pc".into());
+        assert!(joined(&color_args(&p)).starts_with("-color_range pc"));
+
+        // ffprobe and ffmpeg spell bt2020 differently, and passing ffprobe's
+        // spelling through would fail the export rather than mislabel it.
+        p.source.colorspace = Some("bt2020nc".into());
+        assert!(joined(&color_args(&p)).contains("-colorspace bt2020ncl"));
+
+        // Anything unrecognised — or absent — is bt709, which is both the old
+        // behaviour and the right guess for a screen capture.
+        let mut unknown = project();
+        unknown.source.colorspace = Some("something new".into());
+        let a = joined(&color_args(&unknown));
+        assert_eq!(
+            a,
+            "-color_range tv -colorspace bt709 -color_primaries bt709 -color_trc bt709"
+        );
+        assert_eq!(joined(&color_args(&project())), a, "an unprobed source too");
+    }
+
+    /// HDR is tone-mapped to SDR by the filter chain, so the file being written
+    /// is bt709 whatever arrived. Tagging it with the source's PQ metadata
+    /// would describe the input and mislead every player.
+    #[test]
+    fn a_tone_mapped_hdr_source_is_tagged_as_what_comes_out() {
+        let mut p = project();
+        p.source.is_hdr = true;
+        p.source.colorspace = Some("bt2020nc".into());
+        p.source.color_primaries = Some("bt2020".into());
+        p.source.color_transfer = Some("smpte2084".into());
+        assert_eq!(
+            joined(&color_args(&p)),
+            "-color_range tv -colorspace bt709 -color_primaries bt709 -color_trc bt709"
+        );
+    }
+
     #[test]
     fn golden_probe_args() {
         assert_eq!(
@@ -822,13 +948,15 @@ mod tests {
         );
     }
 
+    /// 1920×1080 asked for 9:16 is a 1080×1920 frame with the picture fitted
+    /// into it — scale first so it cannot be cropped, then pad the rest.
     #[test]
     fn pad_mode_scales_then_pads() {
         let mut p = project();
         p.aspect_mode = AspectMode::PadToRatio(Rational::new(9, 16));
         let a = video_filter_chain(&p);
         assert!(
-            a.starts_with("scale=1920:3412:force_original_aspect_ratio=decrease,pad=1920:3412:"),
+            a.starts_with("scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:"),
             "{a}"
         );
     }
