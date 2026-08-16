@@ -152,7 +152,14 @@ pub fn run_import(tools: Tools, project: Project, cache: SourceCache, tx: Tx, ca
 /// what makes undoing a track removal cheap: the samples were dropped from
 /// memory, not from disk. It reports no duration, because nothing was probed —
 /// the caller keeps the duration it already has.
-pub fn load_track(tools: Tools, id: TrackId, path: PathBuf, dest: PathBuf, tx: Tx) {
+///
+/// `cancel` belongs to the caller, deliberately. Decoding a 60-minute podcast
+/// is a long ffmpeg run, and a token created here would be held by nobody:
+/// there would be no way to stop it, and it would outlive the window it was
+/// started from. An orphaned child is not reliably cleaned up by the OS on any
+/// of the three platforms — the same reason [`FrameServer`] hands its worker
+/// the token rather than letting it make one.
+pub fn load_track(tools: Tools, id: TrackId, path: PathBuf, dest: PathBuf, tx: Tx, cancel: Cancel) {
     if is_usable(&dest) {
         if let Ok(pcm) = Pcm::load(&dest) {
             let _ = tx.send(Msg::TrackReady {
@@ -163,16 +170,26 @@ pub fn load_track(tools: Tools, id: TrackId, path: PathBuf, dest: PathBuf, tx: T
             return;
         }
     }
+    if cancel.is_cancelled() {
+        return;
+    }
     let duration = probe_duration(&tools, &path);
-    let cancel = Cancel::new();
     let pcm = if tools
         .run_with_progress(&command::track_pcm_args(&path, &dest), &cancel, |_| {})
         .is_ok()
     {
         Pcm::load(&dest).ok()
     } else {
+        // A killed decode leaves a partial scratch file that would be read back
+        // as the whole track on the next attempt.
+        let _ = std::fs::remove_file(&dest);
         None
     };
+    // Nothing is listening once the app is going away, and a `TrackReady` for
+    // a decode that was killed would arrive claiming the track has no audio.
+    if cancel.is_cancelled() {
+        return;
+    }
     let _ = tx.send(Msg::TrackReady { id, duration, pcm });
 }
 

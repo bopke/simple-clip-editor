@@ -75,8 +75,12 @@ impl eframe::App for App {
         // work is written out, saved work clears it.
         self.finish_session();
         // Kill anything still running and take the intermediates with it.
+        // Every ffmpeg child the app started is reachable from one of these:
+        // an orphan is not reliably cleaned up by the OS on any of the three
+        // platforms, and a track decode is the longest-running of them.
         self.cancel_import();
         self.cancel_export();
+        self.track_cancel.cancel();
         self.stop_playback();
         if let Some(frames) = &self.frames {
             frames.shutdown();

@@ -213,3 +213,43 @@ fn the_mixer_matches_audio_to_tracks_by_identity() {
     assert_eq!(state.tracks[0].pcm.samples[0], 0.5, "and it is B's audio");
     assert!(!app.track_pcm.contains_key(&a_id));
 }
+
+/// A track decode is the longest ffmpeg run the app starts — a 60-minute
+/// podcast is minutes of work — and it used to build its own cancel token,
+/// which nothing else held. There was no way to stop it, so it outlived the
+/// window that started it. The token now belongs to `App`, which is what makes
+/// the exit path able to reach the child.
+#[test]
+fn a_track_decode_stops_when_the_app_does() {
+    let ctx = egui::Context::default();
+    let (app, _a_id, _b_id) = app_with_two_tracks(&ctx);
+    let id = _a_id;
+
+    // What `on_exit` does to every decode in flight.
+    app.track_cancel.cancel();
+    assert!(app.track_cancel.is_cancelled());
+
+    // A worker started under that token does no work and reports nothing: a
+    // `TrackReady` arriving after cancellation would claim the track has no
+    // audio, on the way out of a process that is not listening anyway.
+    let tools = clip_editor::ffmpeg::Tools {
+        ffmpeg: "/definitely/not/ffmpeg".into(),
+        ffprobe: "/definitely/not/ffprobe".into(),
+        origin: clip_editor::ffmpeg::Origin::Managed,
+    };
+    let dest = std::env::temp_dir().join("clipper-track-cancel-scratch.f32");
+    let _ = std::fs::remove_file(&dest);
+    clip_editor::import::load_track(
+        tools,
+        id,
+        "/m/a.mp3".into(),
+        dest.clone(),
+        app.tx.clone(),
+        app.track_cancel.clone(),
+    );
+    assert!(
+        app.rx.try_recv().is_err(),
+        "a cancelled decode has nothing to report"
+    );
+    assert!(!dest.exists());
+}

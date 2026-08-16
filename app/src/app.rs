@@ -68,6 +68,10 @@ pub struct App {
     /// one that needs loading — it may be one that is loading right now, and
     /// starting a second decode would put two writers on one scratch file.
     pub loading_tracks: HashSet<TrackId>,
+    /// Cancels every added-track decode. One token for the app rather than one
+    /// per load: what it is for is the exit path, where each of these is an
+    /// ffmpeg child that has to be killed rather than left behind.
+    pub track_cancel: Cancel,
     pub thumbs: Vec<PathBuf>,
     pub thumb_textures: Vec<egui::TextureHandle>,
 
@@ -163,6 +167,7 @@ impl App {
             pcm: None,
             track_pcm: HashMap::new(),
             loading_tracks: HashSet::new(),
+            track_cancel: Cancel::new(),
             thumbs: Vec::new(),
             thumb_textures: Vec::new(),
             frames,
@@ -503,9 +508,10 @@ impl App {
         self.loading_tracks.insert(id);
         let dest = scratch_path(&cache, id);
         let tx = self.tx.clone();
+        let cancel = self.track_cancel.clone();
         std::thread::Builder::new()
             .name("track-load".into())
-            .spawn(move || import::load_track(tools, id, path, dest, tx))
+            .spawn(move || import::load_track(tools, id, path, dest, tx, cancel))
             .expect("spawning track loader");
     }
 

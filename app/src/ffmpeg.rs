@@ -266,6 +266,10 @@ fn tail(s: &str) -> String {
     lines[start..].join("; ")
 }
 
+/// First and longest gap between `try_wait` polls. See [`Cancel::wait`].
+const POLL_MIN: std::time::Duration = std::time::Duration::from_millis(1);
+const POLL_MAX: std::time::Duration = std::time::Duration::from_millis(15);
+
 /// Cancel token for a job. Every job needs one — users will open the wrong
 /// file and hit export.
 #[derive(Clone, Default)]
@@ -329,7 +333,16 @@ impl Cancel {
 
     /// Wait by polling, so the lock is free between polls and `cancel()` never
     /// has to wait for the process it is trying to kill.
+    ///
+    /// The interval backs off rather than being fixed, because the two kinds of
+    /// job here want opposite things. A single-frame decode — one per scrub
+    /// position, thousands of them in a drag — finishes in a few milliseconds,
+    /// and a flat 15 ms poll adds most of a frame's latency to every one of
+    /// them for nothing. An export runs for minutes and does not care. Starting
+    /// at [`POLL_MIN`] and doubling to [`POLL_MAX`] pays the short jobs back
+    /// without spinning through the long ones.
     fn wait(&self, id: u64) -> Result<std::process::ExitStatus> {
+        let mut interval = POLL_MIN;
         loop {
             {
                 let mut guard = self
@@ -343,7 +356,8 @@ impl Cancel {
                     return Ok(status);
                 }
             }
-            std::thread::sleep(std::time::Duration::from_millis(15));
+            std::thread::sleep(interval);
+            interval = (interval * 2).min(POLL_MAX);
         }
     }
 

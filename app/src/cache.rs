@@ -15,6 +15,13 @@ use std::time::{Duration, SystemTime};
 /// Cached artifacts older than this are removed at startup.
 const MAX_AGE: Duration = Duration::from_secs(60 * 60 * 24 * 14);
 
+/// Export scratch untouched for this long belongs to a run that died.
+///
+/// Longer than any export anyone will sit through, because deleting a live
+/// one's intermediates ruins it, while leaving a dead one's costs disk until
+/// the next launch.
+const MAX_EXPORT_AGE: Duration = Duration::from_secs(60 * 60 * 6);
+
 pub fn cache_root() -> Result<PathBuf> {
     let dirs = directories::ProjectDirs::from("", "", "clip-editor")
         .ok_or_else(|| anyhow!("no home directory"))?;
@@ -177,6 +184,28 @@ fn used_marker(dir: &Path) -> PathBuf {
     dir.join(".used")
 }
 
+/// Remove export scratch left by runs that are not coming back, and only those.
+/// Split out from [`cleanup`] so it can be tested against a directory that is
+/// not the real cache root.
+fn sweep_export(dir: &Path, now: SystemTime) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // Unreadable or from the future reads as age zero, i.e. keep it. The
+        // failure that matters here is deleting something in use.
+        let age = fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .unwrap_or_default();
+        if age > MAX_EXPORT_AGE {
+            let _ = fs::remove_dir_all(&path);
+        }
+    }
+}
+
 /// When this source was last opened.
 ///
 /// Falls back to the directory's own mtime when the marker is missing or
@@ -203,15 +232,28 @@ fn last_used(dir: &Path) -> Option<SystemTime> {
 /// `MAX_AGE` can have its cache removed from under it. The files it already
 /// opened survive on unix, and on Windows the removal fails and is ignored;
 /// either way the worst case is a rebuilt proxy, not a wrong result.
+///
+/// Export scratch is the case where that reasoning does not hold, so it is
+/// swept by age rather than removed outright — see [`sweep_export`]. Losing an
+/// export's intermediates is not a rebuilt proxy, it is a failed export.
 pub fn cleanup() {
     let Ok(root) = cache_root() else { return };
-    // Export intermediates are never worth keeping across runs.
-    let _ = fs::remove_dir_all(root.join("export"));
+    let now = SystemTime::now();
+
+    // Export intermediates are not worth keeping across runs, but "not mine"
+    // and "not running" are different questions. [`ExportTemp::unique_tag`]
+    // goes to trouble to keep two exports out of each other's directories, and
+    // removing the shared parent here undid all of it: opening a second copy of
+    // the app pulled Phase A's segments out from under the first one's
+    // twenty-minute export. Age is the cross-platform stand-in for liveness —
+    // a live export writes a segment every few seconds, so anything this old
+    // belongs to a run that is not coming back. `Drop` still handles the
+    // ordinary case; this is only for the runs that died.
+    sweep_export(&root.join("export"), now);
 
     let Ok(entries) = fs::read_dir(root.join("sources")) else {
         return;
     };
-    let now = SystemTime::now();
     for entry in entries.flatten() {
         let path = entry.path();
         // A marker from the future (clock skew, a restored backup) yields no
@@ -324,6 +366,37 @@ mod tests {
         assert_eq!(cache.thumbs().len(), 5);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The original bug: a second copy of the app starting up removed the
+    /// shared `export/` parent, and a twenty-minute export running in the first
+    /// one lost its Phase A segments. Everything `unique_tag` does to keep two
+    /// exports apart was undone by the sweep above them.
+    #[test]
+    fn the_export_sweep_leaves_a_running_export_alone() {
+        let root = temp_dir("export-sweep");
+        let live = root.join("991-abc-0");
+        let dead = root.join("117-def-0");
+        for dir in [&live, &dead] {
+            fs::create_dir_all(dir).unwrap();
+            fs::write(dir.join("seg_0000.mkv"), b"segment").unwrap();
+        }
+
+        // Now: both were written moments ago, so neither is abandoned.
+        sweep_export(&root, SystemTime::now());
+        assert!(live.exists(), "a live export must survive another startup");
+        assert!(dead.exists());
+
+        // Long enough later that nothing here can still be running.
+        let later = SystemTime::now() + MAX_EXPORT_AGE + Duration::from_secs(60);
+        sweep_export(&root, later);
+        assert!(!live.exists());
+        assert!(!dead.exists(), "abandoned scratch is still collected");
+
+        // A missing export directory is the common case, not an error.
+        sweep_export(&root.join("nope"), SystemTime::now());
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
