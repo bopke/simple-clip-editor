@@ -1,4 +1,29 @@
 //! Exact rational time. Edit points never touch `f64`.
+//!
+//! # Where `f64` is and is not allowed
+//!
+//! The rule is about *what the number becomes*, not about which file it is in.
+//! A cast is a bug when its result is stored as, or decides, an edit point:
+//! a segment boundary, the playhead, the selection, the crop rectangle. Those
+//! go through [`Rational`]/[`RationalTime`] — [`FrameIdx::to_time`] and
+//! [`FrameIdx::from_time_round`] convert between a frame on some grid and the
+//! instant it names, exactly, at any rate.
+//!
+//! Three kinds of `f64`/`as` remain deliberately, and are not worth converting:
+//!
+//! - **Pixel geometry** (`crop.rs`, `model::pad_box`, `scale_to_long_edge`).
+//!   A pointer position is a float by nature and the result is quantised to
+//!   whole even pixels before it is stored. There is no exact value being lost.
+//! - **UI layout** (`ui_timeline`, `ui_preview`). Frames map to and from screen
+//!   x-coordinates; the float is the screen, and the frame index that comes
+//!   back out is an integer.
+//! - **Audio sample maths** (`playback.rs`, `audio.rs`, `audio_math.rs`).
+//!   Samples are `f32` all the way to the device, and the mixer's arithmetic is
+//!   over sample values rather than over positions in the edit.
+//!
+//! The distinction that matters: rounding a *display* is discarded on the next
+//! frame, while rounding an *edit point* is written into the project and
+//! compounds every time it happens again.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -273,6 +298,21 @@ impl RationalTime {
             den: self.den,
         };
         t.as_millis_round()
+    }
+}
+
+/// Ordering by value, not by representation. `new` normalises, so every
+/// `RationalTime` in the model has a unique `(num, den)` and the derived
+/// `PartialEq` agrees with this comparison rather than contradicting it.
+impl Ord for RationalTime {
+    fn cmp(&self, other: &RationalTime) -> std::cmp::Ordering {
+        self.cmp_time(*other)
+    }
+}
+
+impl PartialOrd for RationalTime {
+    fn partial_cmp(&self, other: &RationalTime) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 

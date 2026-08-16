@@ -46,8 +46,8 @@ impl MixState {
         original: Option<Arc<Pcm>>,
         track_pcm: &HashMap<TrackId, Arc<Pcm>>,
     ) -> MixState {
-        let timeline = Timeline::new(project.normalised_segments());
         let fps = project.project_fps;
+        let timeline = Timeline::new(&project.normalised_segments(), fps);
         let total_samples =
             (timeline.duration(fps).as_f64() * PCM_SAMPLE_RATE as f64).max(0.0) as u64;
         let tracks = project
@@ -414,6 +414,11 @@ mod tests {
         })
     }
 
+    /// The fixture source runs at 60 fps; segments are named by its frames.
+    fn seg(start: u64, end: u64) -> Segment {
+        Segment::from_frames(FrameIdx(start), FrameIdx(end), Rational::from_int(60))
+    }
+
     fn project_with_cut() -> Project {
         let mut p = Project::new(SourceInfo {
             duration: RationalTime::new(10, 1),
@@ -431,16 +436,7 @@ mod tests {
             }],
             ..Default::default()
         });
-        p.segments = vec![
-            Segment {
-                start: FrameIdx(0),
-                end: FrameIdx(60),
-            },
-            Segment {
-                start: FrameIdx(300),
-                end: FrameIdx(360),
-            },
-        ];
+        p.segments = vec![seg(0, 60), seg(300, 360)];
         p
     }
 

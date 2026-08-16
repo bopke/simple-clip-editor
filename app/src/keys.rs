@@ -3,7 +3,7 @@
 //! start rather than retrofitted onto mouse-centric code.
 
 use crate::app::App;
-use clip_core::{edits, FrameIdx};
+use clip_core::{edits, FrameIdx, RationalTime};
 use egui::Key;
 
 /// Rows for the shortcuts panel, kept next to the handler so the two cannot
@@ -86,19 +86,21 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
             }
             Key::Home => {
                 app.pause();
+                let fps = app.fps();
                 let first = app
                     .project
                     .as_ref()
-                    .and_then(|p| p.normalised_segments().first().map(|s| s.start))
+                    .and_then(|p| p.normalised_segments().first().map(|s| s.start_frame(fps)))
                     .unwrap_or(FrameIdx(0));
                 app.seek_source(first);
             }
             Key::End => {
                 app.pause();
+                let fps = app.fps();
                 let last = app
                     .project
                     .as_ref()
-                    .and_then(|p| p.normalised_segments().last().map(|s| s.end))
+                    .and_then(|p| p.normalised_segments().last().map(|s| s.end_frame(fps)))
                     .map(|f| f.saturating_sub(1))
                     .unwrap_or(FrameIdx(0));
                 app.seek_source(last);
@@ -112,9 +114,14 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
     }
 }
 
+/// One second as a whole number of frames — the Shift+arrow jump. Through the
+/// rate rather than through `fps.as_f64().round()`, so 29.97 is the 30 frames
+/// that actually make up a second of it rather than a rounded rate.
 fn seconds_in_frames(app: &App) -> u64 {
     let fps = app.fps();
-    (fps.as_f64().round() as u64).max(1)
+    FrameIdx::from_time_round(RationalTime::new(1, 1), fps)
+        .0
+        .max(1)
 }
 
 /// `L` repeatedly goes faster; `J` the same in reverse. Only ±1 plays audio —
@@ -138,19 +145,21 @@ fn shuttle(app: &mut App, direction: i32) {
 }
 
 pub fn set_in(app: &mut App) {
-    let playhead = app.playhead;
+    let at = app.playhead.to_time(app.fps());
     app.snapshot();
     if let Some(p) = app.project.as_mut() {
-        edits::set_in(&mut p.segments, playhead);
+        edits::set_in(&mut p.segments, at);
     }
     app.after_edit();
 }
 
 pub fn set_out(app: &mut App) {
-    let playhead = app.playhead;
+    // The playhead frame is kept, so the out-point is where the next frame
+    // would start.
+    let end = app.playhead.saturating_add(1).to_time(app.fps());
     app.snapshot();
     if let Some(p) = app.project.as_mut() {
-        edits::set_out(&mut p.segments, playhead);
+        edits::set_out(&mut p.segments, end);
     }
     app.after_edit();
 }
@@ -158,9 +167,10 @@ pub fn set_out(app: &mut App) {
 /// With a selection, `X` removes exactly that range. Without one, it removes
 /// from the playhead to the end of the segment the playhead is in.
 pub fn delete_range(app: &mut App) {
-    let playhead = app.playhead;
+    let fps = app.fps();
+    let playhead = app.playhead.to_time(fps);
     let range = match app.selection {
-        Some((a, b)) if b.0 > a.0 => Some((a, b)),
+        Some((a, b)) if b.0 > a.0 => Some((a.to_time(fps), b.to_time(fps))),
         _ => app.project.as_ref().and_then(|p| {
             let segs = p.normalised_segments();
             edits::segment_at(&segs, playhead).map(|i| (playhead, segs[i].end))

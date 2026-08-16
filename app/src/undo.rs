@@ -54,15 +54,20 @@ impl UndoStack {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clip_core::{FrameIdx, Segment, SourceInfo};
+    use clip_core::{FrameIdx, Rational, Segment, SourceInfo};
 
+    const FPS: Rational = Rational { num: 30, den: 1 };
+
+    /// A project whose only distinguishing feature is where its one segment
+    /// ends — enough to tell two snapshots apart.
     fn project(end: u64) -> Project {
         let mut p = Project::new(SourceInfo::default());
-        p.segments = vec![Segment {
-            start: FrameIdx(0),
-            end: FrameIdx(end),
-        }];
+        p.segments = vec![Segment::from_frames(FrameIdx(0), FrameIdx(end), FPS)];
         p
+    }
+
+    fn end_frame(p: &Project) -> FrameIdx {
+        p.segments[0].end_frame(FPS)
     }
 
     #[test]
@@ -73,10 +78,10 @@ mod tests {
         stack.push(a.clone());
         assert!(stack.can_undo());
         let restored = stack.undo(b.clone()).unwrap();
-        assert_eq!(restored.segments[0].end, FrameIdx(100));
+        assert_eq!(end_frame(&restored), FrameIdx(100));
         assert!(stack.can_redo());
         let again = stack.redo(restored).unwrap();
-        assert_eq!(again.segments[0].end, FrameIdx(200));
+        assert_eq!(end_frame(&again), FrameIdx(200));
     }
 
     #[test]
@@ -98,9 +103,9 @@ mod tests {
         assert_eq!(stack.depth(), MAX_DEPTH);
         // The *oldest* entries are the ones dropped, so the 20 overflowing
         // pushes cost states 0..20 and the newest is still on top.
-        assert_eq!(stack.past.front().unwrap().segments[0].end, FrameIdx(20));
+        assert_eq!(end_frame(stack.past.front().unwrap()), FrameIdx(20));
         assert_eq!(
-            stack.past.back().unwrap().segments[0].end,
+            end_frame(stack.past.back().unwrap()),
             FrameIdx((MAX_DEPTH + 19) as u64)
         );
     }

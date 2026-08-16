@@ -11,7 +11,7 @@ use crate::jobs::Msg;
 use anyhow::{bail, Result};
 use clip_core::command::{self, HwEncoder};
 use clip_core::progress::fraction;
-use clip_core::{Project, RationalTime};
+use clip_core::Project;
 use crossbeam_channel::Sender;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -62,7 +62,7 @@ fn export(
     }
     let temp = ExportTemp::new()?;
     let fps = project.project_fps;
-    let total_frames: u64 = segments.iter().map(|s| s.len()).sum();
+    let total_frames: u64 = segments.iter().map(|s| s.len_frames(fps)).sum();
 
     // Per-segment progress, combined into one weighted bar.
     let progress: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(vec![0.0; segments.len()]));
@@ -71,7 +71,7 @@ fn export(
         let tx = tx.clone();
         let weights: Vec<f32> = segments
             .iter()
-            .map(|s| s.len() as f32 / total_frames.max(1) as f32)
+            .map(|s| s.len_frames(fps) as f32 / total_frames.max(1) as f32)
             .collect();
         move || {
             let p = progress.lock().expect("progress lock");
@@ -108,7 +108,7 @@ fn export(
                     let seg = segments[i];
                     let out = temp_dir.segment(i);
                     let args = command::export_segment_args(project, seg, hw, &out);
-                    let seg_dur = RationalTime::new(seg.len() as i64 * fps.den, fps.num);
+                    let seg_dur = seg.duration();
                     let result = tools.run_with_progress(&args, cancel, |u| {
                         if let Ok(mut p) = progress.lock() {
                             p[i] = fraction(&u, seg_dur);

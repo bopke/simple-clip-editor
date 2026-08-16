@@ -443,7 +443,6 @@ pub fn export_segment_args(
     hw: Option<HwEncoder>,
     out: &Path,
 ) -> Vec<String> {
-    let fps = project.project_fps;
     let mut a = base();
     if needs_noautorotate(project.source.rotation) {
         a.push(s("-noautorotate"));
@@ -453,9 +452,9 @@ pub fn export_segment_args(
     // so this is frame-accurate as well as fast.
     a.extend([
         s("-ss"),
-        seg.start_time(fps).to_ffmpeg_arg(),
+        seg.start.to_ffmpeg_arg(),
         s("-to"),
-        seg.end_time(fps).to_ffmpeg_arg(),
+        seg.end.to_ffmpeg_arg(),
         s("-i"),
         p(&project.source.path),
     ]);
@@ -733,6 +732,12 @@ mod tests {
         Project::new(src)
     }
 
+    /// Every project here runs at 60 fps, so a segment is named by the frames
+    /// it covers on that grid.
+    fn seg(start: u64, end: u64) -> Segment {
+        Segment::from_frames(FrameIdx(start), FrameIdx(end), Rational::from_int(60))
+    }
+
     fn joined(v: &[String]) -> String {
         v.join(" ")
     }
@@ -777,10 +782,7 @@ mod tests {
     #[test]
     fn golden_segment_args_default_preset() {
         let mut p = project();
-        p.segments = vec![Segment {
-            start: FrameIdx(60),
-            end: FrameIdx(180),
-        }];
+        p.segments = vec![seg(60, 180)];
         let seg = p.segments[0];
         assert_eq!(
             joined(&export_segment_args(
@@ -834,16 +836,7 @@ mod tests {
     #[test]
     fn every_segment_gets_identical_encoder_settings() {
         let mut p = project();
-        p.segments = vec![
-            Segment {
-                start: FrameIdx(0),
-                end: FrameIdx(60),
-            },
-            Segment {
-                start: FrameIdx(600),
-                end: FrameIdx(900),
-            },
-        ];
+        p.segments = vec![seg(0, 60), seg(600, 900)];
         let a = export_segment_args(&p, p.segments[0], None, Path::new("/t/0.mkv"));
         let b = export_segment_args(&p, p.segments[1], None, Path::new("/t/1.mkv"));
         let strip = |v: Vec<String>| -> Vec<String> {
@@ -899,10 +892,7 @@ mod tests {
     #[test]
     fn golden_final_args_with_two_music_tracks() {
         let mut p = project();
-        p.segments = vec![Segment {
-            start: FrameIdx(0),
-            end: FrameIdx(600),
-        }];
+        p.segments = vec![seg(0, 600)];
         let mut t1 = AudioTrack::new(PathBuf::from("/m/one.mp3"));
         t1.offset = RationalTime::new(5, 1);
         t1.gain_db = -6.0;
@@ -937,10 +927,7 @@ mod tests {
     #[test]
     fn fade_out_ends_with_the_output_and_lasts_the_shared_length() {
         let mut p = project();
-        p.segments = vec![Segment {
-            start: FrameIdx(0),
-            end: FrameIdx(600),
-        }];
+        p.segments = vec![seg(0, 600)];
         let mut t = AudioTrack::new(PathBuf::from("/m/one.mp3"));
         t.fade_out = true;
         p.added_tracks = vec![t];
@@ -961,10 +948,7 @@ mod tests {
     #[test]
     fn fade_out_on_a_clip_shorter_than_the_fade_starts_at_zero() {
         let mut p = project();
-        p.segments = vec![Segment {
-            start: FrameIdx(0),
-            end: FrameIdx(30),
-        }];
+        p.segments = vec![seg(0, 30)];
         let mut t = AudioTrack::new(PathBuf::from("/m/one.mp3"));
         t.fade_out = true;
         p.added_tracks = vec![t];
@@ -1148,16 +1132,7 @@ mod tests {
     #[test]
     fn output_length_is_pinned_to_the_timeline() {
         let mut p = project();
-        p.segments = vec![
-            Segment {
-                start: FrameIdx(0),
-                end: FrameIdx(60),
-            },
-            Segment {
-                start: FrameIdx(600),
-                end: FrameIdx(660),
-            },
-        ];
+        p.segments = vec![seg(0, 60), seg(600, 660)];
         let a = joined(&export_final_args(
             &p,
             Path::new("/t/l.txt"),

@@ -38,6 +38,11 @@ fn require_ffmpeg() -> bool {
     std::env::var("CLIP_REQUIRE_FFMPEG").is_ok_and(|v| !v.is_empty())
 }
 
+/// The fixture source runs at 30 fps; segments are named by its frames.
+fn seg(start: u64, end: u64) -> Segment {
+    Segment::from_frames(FrameIdx(start), FrameIdx(end), Rational::from_int(30))
+}
+
 fn workdir(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("clip-editor-test-{name}"));
     let _ = std::fs::remove_dir_all(&dir);
@@ -211,16 +216,7 @@ fn exports_two_segments_with_a_crop() {
 
     let mut project = Project::new(info);
     // Keep 0-1s and 3-4s: two segments, exactly two seconds of output.
-    project.segments = vec![
-        Segment {
-            start: FrameIdx(0),
-            end: FrameIdx(30),
-        },
-        Segment {
-            start: FrameIdx(90),
-            end: FrameIdx(120),
-        },
-    ];
+    project.segments = vec![seg(0, 30), seg(90, 120)];
     project.crop = Some(CropRect {
         x: 0,
         y: 0,
@@ -258,10 +254,7 @@ fn exports_with_an_added_music_track() {
     let info = import::probe_source(&tools, &src).expect("probe");
 
     let mut project = Project::new(info);
-    project.segments = vec![Segment {
-        start: FrameIdx(0),
-        end: FrameIdx(90),
-    }];
+    project.segments = vec![seg(0, 90)];
     project.original_audio.gain_db = -6.0;
 
     let mut track = AudioTrack::new(music.clone());
@@ -294,10 +287,7 @@ fn exports_every_preset() {
 
     for preset in OutputPreset::ALL {
         let mut project = Project::new(info.clone());
-        project.segments = vec![Segment {
-            start: FrameIdx(0),
-            end: FrameIdx(30),
-        }];
+        project.segments = vec![seg(0, 30)];
         project.output.preset = *preset;
         // Keep the slow codecs honest about time without changing code paths.
         project.output.long_edge = Some(160);
@@ -405,10 +395,7 @@ fn cancelling_an_export_leaves_no_output() {
     let src = make_source(&tools, &dir);
     let info = import::probe_source(&tools, &src).expect("probe");
     let mut project = Project::new(info);
-    project.segments = vec![Segment {
-        start: FrameIdx(0),
-        end: FrameIdx(180),
-    }];
+    project.segments = vec![seg(0, 180)];
 
     let (tx, rx) = jobs::channel();
     let cancel = Cancel::new();

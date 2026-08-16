@@ -6,32 +6,62 @@
 use crate::model::Segment;
 use crate::time::{FrameIdx, Rational, RationalTime};
 
+/// One kept range as source frame indices, `[start, end)`.
+#[derive(Clone, Copy, Debug)]
+struct Span {
+    start: u64,
+    end: u64,
+}
+
+impl Span {
+    fn len(self) -> u64 {
+        self.end.saturating_sub(self.start)
+    }
+
+    fn contains(self, f: u64) -> bool {
+        f >= self.start && f < self.end
+    }
+}
+
+/// The edit as whole frames of one rate.
+///
+/// Segments are times, but playback and export both walk a frame at a time, so
+/// the rounding onto the grid happens once here rather than at every lookup.
 #[derive(Clone, Debug, Default)]
 pub struct Timeline {
     /// Kept ranges in output order, non-overlapping.
-    segments: Vec<Segment>,
-    /// `starts[i]` is the output frame at which `segments[i]` begins.
+    spans: Vec<Span>,
+    /// `starts[i]` is the output frame at which `spans[i]` begins.
     starts: Vec<u64>,
     total: u64,
 }
 
 impl Timeline {
-    pub fn new(segments: Vec<Segment>) -> Timeline {
+    pub fn new(segments: &[Segment], fps: Rational) -> Timeline {
+        let mut spans = Vec::with_capacity(segments.len());
         let mut starts = Vec::with_capacity(segments.len());
         let mut acc = 0u64;
-        for s in &segments {
+        for s in segments {
+            let (start, end) = s.frame_span(fps);
+            let span = Span {
+                start: start.0,
+                end: end.0,
+            };
+            // A segment shorter than one frame of this grid rounds away to
+            // nothing; keeping it would put a zero-length span in the middle
+            // of the mapping for no frame to land on.
+            if span.len() == 0 {
+                continue;
+            }
             starts.push(acc);
-            acc += s.len();
+            acc += span.len();
+            spans.push(span);
         }
         Timeline {
-            segments,
+            spans,
             starts,
             total: acc,
         }
-    }
-
-    pub fn segments(&self) -> &[Segment] {
-        &self.segments
     }
 
     pub fn total_frames(&self) -> u64 {
@@ -50,15 +80,13 @@ impl Timeline {
     pub fn to_source(&self, out: FrameIdx) -> Option<FrameIdx> {
         let idx = self.segment_at_output(out)?;
         let off = out.0 - self.starts[idx];
-        Some(FrameIdx(self.segments[idx].start.0 + off))
+        Some(FrameIdx(self.spans[idx].start + off))
     }
 
     /// Source frame → output frame. `None` if the frame was cut out.
     pub fn to_output(&self, src: FrameIdx) -> Option<FrameIdx> {
-        let idx = self.segments.iter().position(|s| s.contains(src))?;
-        Some(FrameIdx(
-            self.starts[idx] + (src.0 - self.segments[idx].start.0),
-        ))
+        let idx = self.spans.iter().position(|s| s.contains(src.0))?;
+        Some(FrameIdx(self.starts[idx] + (src.0 - self.spans[idx].start)))
     }
 
     /// Source frame → output frame, snapping a cut-out frame forward to the
@@ -67,8 +95,8 @@ impl Timeline {
         if let Some(o) = self.to_output(src) {
             return Some(o);
         }
-        for (i, s) in self.segments.iter().enumerate() {
-            if src.0 < s.start.0 {
+        for (i, s) in self.spans.iter().enumerate() {
+            if src.0 < s.start {
                 return Some(FrameIdx(self.starts[i]));
             }
         }
@@ -90,17 +118,18 @@ impl Timeline {
 mod tests {
     use super::*;
 
+    fn fps() -> Rational {
+        Rational::from_int(30)
+    }
+
     fn tl() -> Timeline {
-        Timeline::new(vec![
-            Segment {
-                start: FrameIdx(100),
-                end: FrameIdx(200),
-            },
-            Segment {
-                start: FrameIdx(500),
-                end: FrameIdx(560),
-            },
-        ])
+        Timeline::new(
+            &[
+                Segment::from_frames(FrameIdx(100), FrameIdx(200), fps()),
+                Segment::from_frames(FrameIdx(500), FrameIdx(560), fps()),
+            ],
+            fps(),
+        )
     }
 
     #[test]
@@ -136,8 +165,43 @@ mod tests {
 
     #[test]
     fn empty_timeline_is_harmless() {
-        let t = Timeline::new(vec![]);
+        let t = Timeline::new(&[], fps());
         assert!(t.is_empty());
         assert_eq!(t.to_source(FrameIdx(0)), None);
+    }
+
+    /// The same edit viewed at a coarser rate is the same wall-clock span,
+    /// with the frame count that rate can represent.
+    #[test]
+    fn the_same_segments_map_at_another_rate() {
+        let segs = [Segment::from_frames(FrameIdx(0), FrameIdx(300), fps())];
+        let ntsc = Rational::new(24000, 1001);
+        let t = Timeline::new(&segs, ntsc);
+        // 10 s at 23.976 is 240 frames, against 300 at 30.
+        assert_eq!(t.total_frames(), 240);
+        assert_eq!(t.to_source(FrameIdx(0)), Some(FrameIdx(0)));
+    }
+
+    /// A segment too short to survive rounding onto the grid must not leave a
+    /// zero-length hole that breaks the output→source mapping.
+    #[test]
+    fn a_sub_frame_segment_drops_out_of_the_mapping() {
+        let ntsc = Rational::new(24000, 1001);
+        let segs = [
+            Segment::from_frames(FrameIdx(0), FrameIdx(60), fps()),
+            // A hair over a millisecond: nothing at either rate.
+            Segment {
+                start: RationalTime::new(5, 1),
+                end: RationalTime::new(5001, 1000),
+            },
+            Segment::from_frames(FrameIdx(300), FrameIdx(360), fps()),
+        ];
+        for rate in [fps(), ntsc] {
+            let t = Timeline::new(&segs, rate);
+            for o in 0..t.total_frames() {
+                let s = t.to_source(FrameIdx(o)).expect("mapped");
+                assert_eq!(t.to_output(s), Some(FrameIdx(o)), "at {rate:?}");
+            }
+        }
     }
 }

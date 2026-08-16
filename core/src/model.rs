@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Project {
     pub source: SourceInfo,
-    /// Normalised timeline rate. All edit points are frame indices at this rate.
+    /// Normalised timeline rate. This is the grid the UI edits and plays on
+    /// and the rate the export runs at; the edit points themselves are times,
+    /// so changing it re-views the edit rather than rewriting it.
     pub project_fps: Rational,
     /// Kept ranges, in output order.
     pub segments: Vec<Segment>,
@@ -22,15 +24,17 @@ pub struct Project {
 impl Project {
     pub fn new(source: SourceInfo) -> Project {
         let project_fps = source.default_project_fps();
-        let last = source.duration_frames(project_fps);
         let original_audio = OriginalAudio {
             source: source.default_audio_selection(),
             gain_db: 0.0,
         };
         Project {
+            // The whole source, as a duration rather than a frame count: the
+            // initial segment is not an edit and should not be quantised to
+            // whatever rate the project happens to open at.
             segments: vec![Segment {
-                start: FrameIdx(0),
-                end: last,
+                start: RationalTime::ZERO,
+                end: source.duration,
             }],
             crop: None,
             aspect_mode: AspectMode::Free,
@@ -49,7 +53,10 @@ impl Project {
 
     /// Frames in the finished export.
     pub fn output_frames(&self) -> u64 {
-        self.segments.iter().map(|s| s.len()).sum()
+        self.normalised_segments()
+            .iter()
+            .map(|s| s.len_frames(self.project_fps))
+            .sum()
     }
 
     pub fn output_duration(&self) -> RationalTime {
@@ -82,14 +89,14 @@ impl Project {
             .segments
             .iter()
             .copied()
-            .filter(|s| s.end.0 > s.start.0)
+            .filter(|s| !s.is_empty())
             .collect();
-        segs.sort_by_key(|s| s.start.0);
+        segs.sort_by_key(|s| s.start);
         let mut out: Vec<Segment> = Vec::with_capacity(segs.len());
         for s in segs {
             match out.last_mut() {
-                Some(prev) if s.start.0 <= prev.end.0 => {
-                    if s.end.0 > prev.end.0 {
+                Some(prev) if s.start <= prev.end => {
+                    if s.end > prev.end {
                         prev.end = s.end;
                     }
                 }
@@ -193,32 +200,76 @@ impl AudioStreamInfo {
     }
 }
 
-/// A kept range. `start` inclusive, `end` exclusive.
+/// A kept range in source time. `start` inclusive, `end` exclusive.
+///
+/// Times, not frame indices: the project frame rate is a *view* of the source,
+/// and changing the view must not move a cut. A boundary set at 30 fps and
+/// then looked at at 23.976 is the same instant rounded onto a different grid,
+/// so returning to 30 returns the original frame exactly — which rescaling
+/// indices from grid to grid cannot do, since the coarser grid has fewer of
+/// them than there are distinct positions to represent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Segment {
-    pub start: FrameIdx,
-    pub end: FrameIdx,
+    pub start: RationalTime,
+    pub end: RationalTime,
 }
 
 impl Segment {
-    pub fn len(self) -> u64 {
-        self.end.0.saturating_sub(self.start.0)
+    /// A segment covering the frames `[start, end)` of the `fps` grid. The
+    /// editing UI works in whole frames, so this is how an edit becomes a
+    /// time: exactly, at the rate the user was looking at.
+    pub fn from_frames(start: FrameIdx, end: FrameIdx, fps: Rational) -> Segment {
+        Segment {
+            start: start.to_time(fps),
+            end: end.to_time(fps),
+        }
+    }
+
+    pub fn duration(self) -> RationalTime {
+        if self.is_empty() {
+            RationalTime::ZERO
+        } else {
+            self.end - self.start
+        }
     }
 
     pub fn is_empty(self) -> bool {
-        self.len() == 0
+        self.end <= self.start
     }
 
-    pub fn contains(self, f: FrameIdx) -> bool {
-        f.0 >= self.start.0 && f.0 < self.end.0
+    pub fn contains(self, t: RationalTime) -> bool {
+        t >= self.start && t < self.end
     }
 
-    pub fn start_time(self, fps: Rational) -> RationalTime {
-        self.start.to_time(fps)
+    /// The half-open frame range this covers on the `fps` grid. Both ends
+    /// round to the nearest frame, so a segment authored at this rate comes
+    /// back to the frames it was authored from.
+    pub fn frame_span(self, fps: Rational) -> (FrameIdx, FrameIdx) {
+        (
+            FrameIdx::from_time_round(self.start, fps),
+            FrameIdx::from_time_round(self.end, fps),
+        )
     }
 
-    pub fn end_time(self, fps: Rational) -> RationalTime {
-        self.end.to_time(fps)
+    pub fn start_frame(self, fps: Rational) -> FrameIdx {
+        FrameIdx::from_time_round(self.start, fps)
+    }
+
+    pub fn end_frame(self, fps: Rational) -> FrameIdx {
+        FrameIdx::from_time_round(self.end, fps)
+    }
+
+    /// Frames this contributes to the output. Derived from the rounded span
+    /// rather than from the duration, so it always agrees with the frames the
+    /// timeline actually maps.
+    pub fn len_frames(self, fps: Rational) -> u64 {
+        let (a, b) = self.frame_span(fps);
+        b.0.saturating_sub(a.0)
+    }
+
+    pub fn contains_frame(self, f: FrameIdx, fps: Rational) -> bool {
+        let (a, b) = self.frame_span(fps);
+        f.0 >= a.0 && f.0 < b.0
     }
 }
 
@@ -557,6 +608,11 @@ pub fn pad_box((w, h): (u32, u32), r: Rational) -> (u32, u32) {
 mod tests {
     use super::*;
 
+    /// The test source runs at 60 fps; segments are named by frames of it.
+    fn seg(start: u64, end: u64) -> Segment {
+        Segment::from_frames(FrameIdx(start), FrameIdx(end), Rational::from_int(60))
+    }
+
     fn source() -> SourceInfo {
         SourceInfo {
             width: 1920,
@@ -620,38 +676,9 @@ mod tests {
     #[test]
     fn overlapping_segments_merge() {
         let mut p = Project::new(source());
-        p.segments = vec![
-            Segment {
-                start: FrameIdx(100),
-                end: FrameIdx(200),
-            },
-            Segment {
-                start: FrameIdx(0),
-                end: FrameIdx(120),
-            },
-            Segment {
-                start: FrameIdx(500),
-                end: FrameIdx(500),
-            },
-            Segment {
-                start: FrameIdx(300),
-                end: FrameIdx(400),
-            },
-        ];
+        p.segments = vec![seg(100, 200), seg(0, 120), seg(500, 500), seg(300, 400)];
         let n = p.normalised_segments();
-        assert_eq!(
-            n,
-            vec![
-                Segment {
-                    start: FrameIdx(0),
-                    end: FrameIdx(200)
-                },
-                Segment {
-                    start: FrameIdx(300),
-                    end: FrameIdx(400)
-                },
-            ]
-        );
+        assert_eq!(n, vec![seg(0, 200), seg(300, 400),]);
     }
 
     #[test]

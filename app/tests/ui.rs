@@ -37,6 +37,11 @@ fn key(k: egui::Key, modifiers: egui::Modifiers) -> Vec<egui::Event> {
     }]
 }
 
+/// The fixture source runs at 60 fps; segments are named by its frames.
+fn seg(start: u64, end: u64) -> Segment {
+    Segment::from_frames(FrameIdx(start), FrameIdx(end), Rational::from_int(60))
+}
+
 fn test_app(ctx: &egui::Context) -> App {
     let mut app = App::with_context(ctx);
     // The first-run screen is what shows without ffmpeg; the editor proper
@@ -108,16 +113,7 @@ fn renders_a_full_editor_with_crop_and_cuts() {
     let mut app = test_app(&ctx);
     project(&mut app);
     if let Some(p) = app.project.as_mut() {
-        p.segments = vec![
-            Segment {
-                start: FrameIdx(0),
-                end: FrameIdx(600),
-            },
-            Segment {
-                start: FrameIdx(1200),
-                end: FrameIdx(1800),
-            },
-        ];
+        p.segments = vec![seg(0, 600), seg(1200, 1800)];
         p.crop = Some(CropRect {
             x: 656,
             y: 0,
@@ -182,7 +178,7 @@ fn keyboard_edits_the_timeline() {
     // I trims the in-point to the playhead.
     frame(&mut app, &ctx, key(egui::Key::I, egui::Modifiers::NONE));
     assert_eq!(
-        app.project.as_ref().unwrap().segments[0].start,
+        app.project.as_ref().unwrap().segments[0].start_frame(Rational::from_int(60)),
         FrameIdx(61)
     );
 
@@ -197,13 +193,7 @@ fn keyboard_edits_the_timeline() {
 
     // Undo puts it back.
     frame(&mut app, &ctx, key(egui::Key::Z, egui::Modifiers::COMMAND));
-    assert_eq!(
-        app.project.as_ref().unwrap().segments[0],
-        Segment {
-            start: FrameIdx(61),
-            end: FrameIdx(3600)
-        }
-    );
+    assert_eq!(app.project.as_ref().unwrap().segments[0], seg(61, 3600));
 
     // C toggles the crop tool.
     assert!(!app.crop_tool);
@@ -217,10 +207,7 @@ fn home_and_end_go_to_the_edges_of_the_edit() {
     let mut app = test_app(&ctx);
     project(&mut app);
     if let Some(p) = app.project.as_mut() {
-        p.segments = vec![Segment {
-            start: FrameIdx(300),
-            end: FrameIdx(900),
-        }];
+        p.segments = vec![seg(300, 900)];
     }
     frame(&mut app, &ctx, key(egui::Key::End, egui::Modifiers::NONE));
     assert_eq!(app.playhead, FrameIdx(899));

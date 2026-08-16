@@ -184,19 +184,21 @@ fn draw_waveform(app: &App, ui: &mut egui::Ui, rect: Rect) {
 fn dim_cuts(app: &App, ui: &mut egui::Ui, rect: Rect, x_of: &impl Fn(u64) -> f32) {
     let Some(project) = &app.project else { return };
     let painter = ui.painter_at(rect);
+    let fps = project.project_fps;
     let segs = project.normalised_segments();
     let total = project.source_frames().0;
     let mut cursor = 0u64;
     let shade = Color32::from_rgba_unmultiplied(10, 10, 12, 190);
     for s in &segs {
-        if s.start.0 > cursor {
+        let (start, end) = s.frame_span(fps);
+        if start.0 > cursor {
             let r = Rect::from_min_max(
                 Pos2::new(x_of(cursor), rect.min.y),
-                Pos2::new(x_of(s.start.0), rect.max.y),
+                Pos2::new(x_of(start.0), rect.max.y),
             );
             painter.rect_filled(r, 0.0, shade);
         }
-        cursor = s.end.0;
+        cursor = end.0;
     }
     if cursor < total {
         let r = Rect::from_min_max(
@@ -211,10 +213,12 @@ fn draw_segments(app: &App, ui: &mut egui::Ui, rect: Rect, x_of: &impl Fn(u64) -
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 2.0, Color32::from_rgb(22, 23, 26));
     let Some(project) = &app.project else { return };
+    let fps = project.project_fps;
     for s in project.normalised_segments() {
+        let (start, end) = s.frame_span(fps);
         let r = Rect::from_min_max(
-            Pos2::new(x_of(s.start.0), rect.min.y + 2.0),
-            Pos2::new(x_of(s.end.0), rect.max.y - 2.0),
+            Pos2::new(x_of(start.0), rect.min.y + 2.0),
+            Pos2::new(x_of(end.0), rect.max.y - 2.0),
         );
         painter.rect_filled(r, 2.0, Color32::from_rgb(70, 130, 90));
         painter.rect_stroke(

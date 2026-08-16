@@ -96,10 +96,11 @@ fn transport(app: &mut App, ui: &mut egui::Ui) {
                 .clicked()
             {
                 app.pause();
+                let fps = app.fps();
                 let first = app
                     .project
                     .as_ref()
-                    .and_then(|p| p.normalised_segments().first().map(|s| s.start))
+                    .and_then(|p| p.normalised_segments().first().map(|s| s.start_frame(fps)))
                     .unwrap_or(clip_core::FrameIdx(0));
                 app.seek_source(first);
             }
@@ -136,10 +137,11 @@ fn transport(app: &mut App, ui: &mut egui::Ui) {
                 .clicked()
             {
                 app.pause();
+                let fps = app.fps();
                 let last = app
                     .project
                     .as_ref()
-                    .and_then(|p| p.normalised_segments().last().map(|s| s.end))
+                    .and_then(|p| p.normalised_segments().last().map(|s| s.end_frame(fps)))
                     .map(|f| f.saturating_sub(1))
                     .unwrap_or(clip_core::FrameIdx(0));
                 app.seek_source(last);

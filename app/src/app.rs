@@ -16,6 +16,16 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// How far playback may run past a video stream's start before the stream is
+/// restarted rather than fast-forwarded through.
+///
+/// The stream decodes forward from where it began, so seeking within it is
+/// free but arbitrarily far ahead of it is not. This is the point where
+/// starting a new decode at the target beats reading everything in between —
+/// a duration, not a frame count, since it is decode work being traded off and
+/// that is measured in wall-clock seconds at any rate.
+const STREAM_RESTART_AFTER_SECS: i64 = 20;
+
 /// What the first-run screen is doing.
 pub enum Boot {
     /// ffmpeg is available; the app is usable.
@@ -171,10 +181,12 @@ impl App {
 
     pub fn timeline(&self) -> Timeline {
         Timeline::new(
-            self.project
+            &self
+                .project
                 .as_ref()
                 .map(|p| p.normalised_segments())
                 .unwrap_or_default(),
+            self.fps(),
         )
     }
 
@@ -277,14 +289,15 @@ impl App {
         self.snapshot();
         let project = self.project.as_mut().expect("checked just above");
         let old = project.project_fps;
-        // Edit points are frame indices, so they have to be rescaled.
-        let scale = fps.as_f64() / old.as_f64();
-        for seg in &mut project.segments {
-            seg.start = FrameIdx((seg.start.0 as f64 * scale).round() as u64);
-            seg.end = FrameIdx((seg.end.0 as f64 * scale).round() as u64);
-        }
+        // Segments are times, so the edit itself needs no conversion: the same
+        // instants simply land on a different grid. Only the cursors are
+        // expressed in frames, and those convert through their exact time
+        // rather than by scaling the index.
         project.project_fps = fps;
-        self.playhead = FrameIdx((self.playhead.0 as f64 * scale).round() as u64);
+        self.playhead = regrid(self.playhead, old, fps);
+        self.selection = self
+            .selection
+            .map(|(a, b)| (regrid(a, old, fps), regrid(b, old, fps)));
         self.cancel_import();
         self.proxy = None;
         self.waveform = None;
@@ -722,8 +735,12 @@ impl App {
         };
         // Crossing a cut means the stream is decoding the wrong part of the
         // source, so it gets restarted at the new position.
+        let restart_after = FrameIdx::from_time_round(
+            clip_core::RationalTime::new(STREAM_RESTART_AFTER_SECS, 1),
+            fps,
+        );
         let needs_restart = match &self.video_stream {
-            Some(s) => src.0 < s.start_frame.0 || src.0 > s.start_frame.0 + 600,
+            Some(s) => src.0 < s.start_frame.0 || src.0 > s.start_frame.0 + restart_after.0,
             None => true,
         };
         self.playhead = src;
@@ -765,6 +782,17 @@ impl App {
             .map(|f| (f.to_time(self.fps()).as_f64() * PCM_SAMPLE_RATE as f64) as u64)
             .unwrap_or(0)
     }
+}
+
+/// The same instant, as a frame index on a different grid.
+///
+/// Cursors (playhead, selection) are frame indices because they address the
+/// grid the user is looking at, so a rate change has to move them. It goes
+/// through the exact time rather than scaling the index, which is what keeps
+/// repeated changes from drifting — though landing on a coarser grid still
+/// costs sub-frame precision, since that grid has nowhere finer to land.
+fn regrid(f: FrameIdx, from: Rational, to: Rational) -> FrameIdx {
+    FrameIdx::from_time_round(f.to_time(from), to)
 }
 
 /// Where a track's decoded PCM is written. Named by id so the same name is
